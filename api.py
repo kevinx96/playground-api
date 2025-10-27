@@ -446,7 +446,7 @@ def get_event_detail(current_user_id, event_id):
     """
     [UPGRADED ENDPOINT] 获取单个事件的详细信息，并包含所有关联的图片 (已连接DB)
     """
-    print(f"🔵 API: Fetching event detail for event_id: {event_id}") # 添加日志
+    print(f"🔵 API: Fetching event detail for event_id: {event_id}")
     
     conn = None
     cursor = None
@@ -455,38 +455,37 @@ def get_event_detail(current_user_id, event_id):
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
         # 步骤 1: 获取主事件信息
-        # [FIX] 确保字段名与 Flutter Model 匹配
         sql_event = """
         SELECT 
             id, 
             camera_id, 
             equipment_type AS category, 
             score, 
-            event_time AS timestamp, 
-            image_count
+            event_time AS timestamp
         FROM events
         WHERE id = %s;
         """
         cursor.execute(sql_event, (event_id,))
         event_detail = cursor.fetchone()
 
-        print(f"📄 Event detail query result: {event_detail}") # 添加日志
+        print(f"📄 Event detail: {event_detail}")
 
         if not event_detail:
-            print(f"❌ Event {event_id} not found in database") # 添加日志
+            print(f"❌ Event {event_id} not found")
             return jsonify({"success": False, "message": "未找到指定 ID 的事件"}), 404
 
-        # [IMPORTANT] 将 RealDictRow 转换为普通 dict
+        # 转换为普通字典
         event_detail = dict(event_detail)
 
         # 步骤 2: 获取所有关联的图片信息
+        # [FIX] 修改 COALESCE 的类型为 jsonb
         sql_images = """
         SELECT 
             id AS image_id, 
             image_url, 
             timestamp, 
             COALESCE(score, 0) AS score,
-            COALESCE(deduction_items, '[]'::text) AS deduction_items
+            COALESCE(deduction_items, '[]'::jsonb) AS deduction_items
         FROM event_images
         WHERE event_id = %s
         ORDER BY timestamp ASC;
@@ -494,40 +493,41 @@ def get_event_detail(current_user_id, event_id):
         cursor.execute(sql_images, (event_id,))
         images = cursor.fetchall()
 
-        print(f"📸 Found {len(images)} images for event {event_id}") # 添加日志
+        print(f"📸 Found {len(images)} images")
 
-        # [FIX] 转换图片数据并处理 deduction_items
+        # 转换图片数据
         processed_images = []
         for img in images:
             img_dict = dict(img)
             
-            # 处理 deduction_items
-            deductions_data = img_dict.get('deduction_items')
-            if isinstance(deductions_data, str):
-                try:
-                    img_dict['deduction_items'] = json.loads(deductions_data)
-                except json.JSONDecodeError:
-                    print(f"⚠️ Failed to parse deduction_items for image {img_dict.get('image_id')}")
-                    img_dict['deduction_items'] = []
-            elif deductions_data is None:
+            # JSONB 类型会被 psycopg2 自动转换为 Python list/dict
+            # 但还是做一下安全检查
+            deductions = img_dict.get('deduction_items')
+            if not isinstance(deductions, list):
                 img_dict['deduction_items'] = []
-            elif not isinstance(deductions_data, list):
-                img_dict['deduction_items'] = []
+            
+            # 确保 timestamp 是 ISO 格式字符串
+            if isinstance(img_dict.get('timestamp'), datetime):
+                img_dict['timestamp'] = img_dict['timestamp'].isoformat()
             
             processed_images.append(img_dict)
 
-        # 步骤 3: 组合 JSON 响应
+        # 步骤 3: 组合响应
         event_detail['images'] = processed_images
         event_detail['image_count'] = len(processed_images)
+        
+        # 确保主 timestamp 也是 ISO 格式
+        if isinstance(event_detail.get('timestamp'), datetime):
+            event_detail['timestamp'] = event_detail['timestamp'].isoformat()
 
-        print(f"✅ Returning event detail: {event_detail}") # 添加日志
+        print(f"✅ Returning {len(processed_images)} images")
 
         return jsonify({"success": True, "data": event_detail})
 
     except (Exception, psycopg2.DatabaseError) as error:
-        print(f"❌ Database error in get_event_detail: {error}") # 添加日志
+        print(f"❌ Database error: {error}")
         import traceback
-        traceback.print_exc() # 打印完整堆栈
+        traceback.print_exc()
         return jsonify({"success": False, "message": f"数据库错误: {str(error)}"}), 500
     finally:
         if conn:
