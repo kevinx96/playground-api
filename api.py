@@ -324,7 +324,7 @@ def add_event():
         # 步骤 2: 插入关联的图片 (根据计划书的 `event_images` 表)
         if image_count > 0:
             # TODO: 这里的 `image_url_prefix` 应根据您的文件存储策略修改
-            image_url_prefix = "https://storage.example.com/full/" 
+            image_url_prefix = "http://192.168.40.162:8000/"
             
             image_records = []
             for i, img_data in enumerate(images_data_list):
