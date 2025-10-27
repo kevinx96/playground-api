@@ -446,6 +446,8 @@ def get_event_detail(current_user_id, event_id):
     """
     [UPGRADED ENDPOINT] 获取单个事件的详细信息，并包含所有关联的图片 (已连接DB)
     """
+    print(f"🔵 API: Fetching event detail for event_id: {event_id}") # 添加日志
+    
     conn = None
     cursor = None
     try:
@@ -453,54 +455,79 @@ def get_event_detail(current_user_id, event_id):
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
         # 步骤 1: 获取主事件信息
+        # [FIX] 确保字段名与 Flutter Model 匹配
         sql_event = """
-        SELECT id, camera_id, equipment_type AS category, score, event_time AS "timestamp", image_count, status
+        SELECT 
+            id, 
+            camera_id, 
+            equipment_type AS category, 
+            score, 
+            event_time AS timestamp, 
+            image_count
         FROM events
         WHERE id = %s;
         """
         cursor.execute(sql_event, (event_id,))
         event_detail = cursor.fetchone()
 
+        print(f"📄 Event detail query result: {event_detail}") # 添加日志
+
         if not event_detail:
+            print(f"❌ Event {event_id} not found in database") # 添加日志
             return jsonify({"success": False, "message": "未找到指定 ID 的事件"}), 404
 
+        # [IMPORTANT] 将 RealDictRow 转换为普通 dict
+        event_detail = dict(event_detail)
+
         # 步骤 2: 获取所有关联的图片信息
-        # [MODIFIED] 假设 event_images 表已添加 `score` 和 `deduction_items`
         sql_images = """
         SELECT 
             id AS image_id, 
             image_url, 
-            "timestamp", 
-            score, 
-            deduction_items
+            timestamp, 
+            COALESCE(score, 0) AS score,
+            COALESCE(deduction_items, '[]'::text) AS deduction_items
         FROM event_images
         WHERE event_id = %s
-        ORDER BY "timestamp" ASC;
+        ORDER BY timestamp ASC;
         """
         cursor.execute(sql_images, (event_id,))
         images = cursor.fetchall()
 
-        # [FIX] 将 `deduction_items` 从 JSON 字符串转换回列表 (如果 DB 类型是 TEXT)
-        # 如果 DB 类型是 JSONB, psycopg2 会自动处理
+        print(f"📸 Found {len(images)} images for event {event_id}") # 添加日志
+
+        # [FIX] 转换图片数据并处理 deduction_items
+        processed_images = []
         for img in images:
-            deductions_data = img.get('deduction_items')
+            img_dict = dict(img)
+            
+            # 处理 deduction_items
+            deductions_data = img_dict.get('deduction_items')
             if isinstance(deductions_data, str):
                 try:
-                    img['deduction_items'] = json.loads(deductions_data)
+                    img_dict['deduction_items'] = json.loads(deductions_data)
                 except json.JSONDecodeError:
-                    img['deduction_items'] = []
+                    print(f"⚠️ Failed to parse deduction_items for image {img_dict.get('image_id')}")
+                    img_dict['deduction_items'] = []
             elif deductions_data is None:
-                img['deduction_items'] = []
-        
+                img_dict['deduction_items'] = []
+            elif not isinstance(deductions_data, list):
+                img_dict['deduction_items'] = []
+            
+            processed_images.append(img_dict)
+
         # 步骤 3: 组合 JSON 响应
-        event_detail['images'] = images
-        # 修正 image_count 以匹配实际查询到的数量
-        event_detail['image_count'] = len(images) 
+        event_detail['images'] = processed_images
+        event_detail['image_count'] = len(processed_images)
+
+        print(f"✅ Returning event detail: {event_detail}") # 添加日志
 
         return jsonify({"success": True, "data": event_detail})
 
     except (Exception, psycopg2.DatabaseError) as error:
-        print(f"数据库错误 (Event Detail): {error}")
+        print(f"❌ Database error in get_event_detail: {error}") # 添加日志
+        import traceback
+        traceback.print_exc() # 打印完整堆栈
         return jsonify({"success": False, "message": f"数据库错误: {str(error)}"}), 500
     finally:
         if conn:
