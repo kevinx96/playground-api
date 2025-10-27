@@ -616,6 +616,8 @@ def get_periodic_report(current_user_id):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"--- Flask API サーバーをポート {port} で起動します ---")
+    print(f"Listening on 0.0.0.0:{port}")
+
     
     # 检查是否在 Render.com 环境中 (Render 会设置 RENDER 环境变量)
     is_production = 'RENDER' in os.environ
