@@ -259,11 +259,11 @@ def get_events():
         total_pages = (total_records + limit - 1) // limit
 
         # --- 获取分页数据 ---
-        # [FIX] 确保查询了缩略图文件名 (thumbnail_filename)
+        # [FIX] 确保查询了缩略图文件名 (image_filename)
         query = f"""
             SELECT 
                 e.event_id, e.camera_id, e.equipment_type, e.score, 
-                e.event_time, e.status, e.thumbnail_filename
+                e.event_time, e.status, e.image_filename
             FROM events e
             {where_sql}
             ORDER BY e.event_time DESC
@@ -487,7 +487,7 @@ def add_event():
         image_filenames = data.get('image_filenames', []) # 假设 AI 发送 'image_filenames': ['img1.jpg', 'img2.jpg', ...]
         deduction_items = data.get('deductions', []) # 扣分项
         
-        thumbnail_filename = image_filenames[0] if image_filenames else None
+        image_filename = image_filenames[0] if image_filenames else None
 
         conn = None
         cursor = None
@@ -499,10 +499,10 @@ def add_event():
             # 1. 插入主事件 (events)
             cursor.execute(
                 """
-                INSERT INTO events (camera_id, equipment_type, risk_type, score, event_time, status, thumbnail_filename)
+                INSERT INTO events (camera_id, equipment_type, risk_type, score, event_time, status, image_filename)
                 VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING event_id;
                 """,
-                (camera_id, equipment_type, risk_type, score, event_time, 'pending', thumbnail_filename)
+                (camera_id, equipment_type, risk_type, score, event_time, 'pending', image_filename)
             )
             event_id = cursor.fetchone()[0]
             
