@@ -444,10 +444,10 @@ def add_event():
     except (Exception, psycopg2.DatabaseError) as error:
         if conn: conn.rollback()
         print(f"数据库错误 (Add Event): {error}")
-        # 增加对外键错误的特殊提示
-        if "violates foreign key constraint" in str(error) and "camera_id" in str(error):
-             print(f"!!! 外键错误: 'camera_id' ({camera_id}) 在 'cameras' 表中不存在。")
-             return jsonify({"success": False, "message": f"数据库错误: 'camera_id' ({camera_id}) 无效。"}), 500
+        
+        # [FIX] 撤销自定义的、令人困惑的 camera_id 错误处理。
+        # 直接返回原始的数据库错误，这更有助于调试真正的问题
+        # (即 /api/cameras/register 为何没有成功创建 id=1 的摄像头)。
         return jsonify({"success": False, "message": f"数据库错误: {str(error)}"}), 500
     finally:
         if conn:
