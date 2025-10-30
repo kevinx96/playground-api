@@ -2,24 +2,21 @@ import os
 import psycopg2
 import json
 from flask import Flask, jsonify, request
-from datetime import datetime, timedelta # [MODIFIED] 导入 timedelta
-from flask_bcrypt import Bcrypt # [SECURITY] 导入 Bcrypt
-from psycopg2.extras import RealDictCursor, execute_batch # [MODIFIED] 导入 execute_batch
-import decimal # [FIX] 用于处理 Decimal 类型
-import jwt # [SECURITY] 导入 JWT 用于 Token
-from functools import wraps # [SECURITY] 导入 wraps 用于装饰器
+from datetime import datetime, timedelta
+from flask_bcrypt import Bcrypt
+from psycopg2.extras import RealDictCursor, execute_batch
+import decimal
+import jwt
+from functools import wraps
 
 # --- 配置 ---
 app = Flask(__name__)
 
-# [SECURITY] 设置一个安全的密钥，用于 JWT 签名。请在环境变量中替换它！
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'my_dev_secret_key_please_change_me')
 
-# 从 Render 提供的环境变量获取数据库连接 URL
 DATABASE_URL = os.environ.get('DATABASE_URL')
-# DATABASE_URL = "postgresql://..." # 本地测试时取消注释
 IMAGE_BASE_URL = os.environ.get('IMAGE_BASE_URL', 'https://subdistichously-polliniferous-ileen.ngrok-free.dev')
-bcrypt = Bcrypt(app) # [SECURITY] 初始化 Bcrypt
+bcrypt = Bcrypt(app)
 
 # --- 数据库辅助函数 ---
 def get_db_connection():
@@ -37,9 +34,9 @@ def get_db_connection():
 class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, datetime):
-            return obj.isoformat() + 'Z' # 转换为 ISO 格式字符串
+            return obj.isoformat() + 'Z'
         if isinstance(obj, decimal.Decimal):
-            return float(obj) # 转换为 float
+            return float(obj)
         return super(CustomJSONEncoder, self).default(obj)
 app.json_encoder = CustomJSONEncoder
 
@@ -55,7 +52,6 @@ def token_required(f):
         if 'Authorization' in request.headers:
             auth_header = request.headers['Authorization']
             try:
-                # 格式应为 "Bearer <token>"
                 token = auth_header.split(" ")[1]
             except IndexError:
                 return jsonify({"success": False, "message": "无效的认证 Token 格式"}), 401
@@ -64,7 +60,6 @@ def token_required(f):
             return jsonify({"success": False, "message": "未提供认证 Token"}), 401
 
         try:
-            # 验证 JWT Token
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
             current_user_id = data['user_id']
         except jwt.ExpiredSignatureError:
@@ -72,7 +67,6 @@ def token_required(f):
         except jwt.InvalidTokenError:
             return jsonify({"success": False, "message": "无效的 Token"}), 401
         
-        # 将用户信息传递给被装饰的函数
         return f(current_user_id, *args, **kwargs)
 
     return decorated
@@ -92,18 +86,16 @@ def home():
 
 @app.route('/api/auth/register', methods=['POST'])
 def register_user():
-    # ... (函数内容保持不变) ...
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
     email = data.get('email')
     full_name = data.get('full_name')
-    role = data.get('role', 'teacher') # 默认角色
+    role = data.get('role', 'teacher')
 
     if not username or not password or not email or not full_name:
         return jsonify({"success": False, "message": "缺少必需字段"}), 400
 
-    # [SECURITY] 生成密码哈希值
     password_hash = bcrypt.generate_password_hash(password).decode('utf-8')
 
     conn = None
@@ -137,7 +129,6 @@ def register_user():
 
 @app.route('/api/auth/login', methods=['POST'])
 def login_user():
-    # ... (函数内容保持不变) ...
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
@@ -148,7 +139,6 @@ def login_user():
     conn = None
     try:
         conn = get_db_connection()
-        # [IMPROVEMENT] 使用 RealDictCursor 以字典形式返回结果
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
         sql = "SELECT id, username, password_hash, full_name, email, role FROM users WHERE username = %s"
@@ -156,25 +146,21 @@ def login_user():
         user = cursor.fetchone()
 
         if user and bcrypt.check_password_hash(user['password_hash'], password):
-            # 密码正确
-            # [SECURITY] 生成 JWT Token
             token = jwt.encode({
                 'user_id': user['id'],
                 'username': user['username'],
-                'exp': datetime.utcnow() + timedelta(hours=24) # 24小时后过期
+                'exp': datetime.utcnow() + timedelta(hours=24)
             }, app.config['SECRET_KEY'], algorithm="HS256")
             
-            # 从返回的 user 字典中移除密码哈希
             user.pop('password_hash')
             
             return jsonify({
                 "success": True, 
                 "message": "登录成功", 
                 "token": token,
-                "user": user # 返回用户信息
+                "user": user
             })
         else:
-            # 用户名或密码错误
             return jsonify({"success": False, "message": "用户名或密码错误"}), 401
 
     except (Exception, psycopg2.DatabaseError) as error:
@@ -191,14 +177,11 @@ def login_user():
 @app.route('/api/cameras', methods=['GET'])
 @token_required
 def get_cameras(current_user_id):
-    # ... (函数内容保持不变) ...
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        # [MODIFIED] 真实的数据库查询。
-        # 假设 `cameras` 表中已添加 `status` 列
         cursor.execute("SELECT id, name, status FROM cameras WHERE is_active = true ORDER BY name ASC")
         cameras = cursor.fetchall()
         
@@ -216,7 +199,6 @@ def get_cameras(current_user_id):
 @app.route('/api/cameras/<int:camera_id>/stream', methods=['GET'])
 @token_required
 def get_camera_stream(current_user_id, camera_id):
-    # ... (函数内容保持不变) ...
     conn = None
     try:
         conn = get_db_connection()
@@ -248,6 +230,7 @@ def get_camera_stream(current_user_id, camera_id):
 def add_event():
     """
     [MODIFIED] 接收AI脚本的事件数据，并根据分钟/设备类型自动合并事件。
+    icon_url 使用 image_filename 自动生成。
     """
     data = request.get_json()
     if not data:
@@ -257,13 +240,12 @@ def add_event():
     camera_id = data.get('camera_id', 0)
     equipment_type = data.get('equipment_type')
     timestamp_str = data.get('timestamp')
-    risk_type = data.get('risk_type') # "abnormal" 或 "normal"
-    score = data.get('score') # 整个事件的（例如最低）分数
-    image_filename = data.get('image_filename') # 缩略图
-    deductions_list = data.get('deductions', []) # 整个事件的扣分项
+    risk_type = data.get('risk_type')
+    score = data.get('score')
+    image_filename = data.get('image_filename')
+    deductions_list = data.get('deductions', [])
     images_data_list = data.get('images_data', [])
     
-    # 兼容旧格式：如果只提供了 image_filename (代表只有一张图)
     if image_filename and not images_data_list:
         images_data_list = [{
             "filename": image_filename,
@@ -291,9 +273,14 @@ def add_event():
 
     # --- 2. 准备新数据（用于插入或更新） ---
     new_image_count = len(images_data_list)
-    request_lowest_score = score # 默认为请求中的 "score"
+    request_lowest_score = score
     request_deductions_set = set(deductions_list)
     thumbnail_filename = image_filename or images_data_list[0].get("filename")
+    
+    # [NEW] 使用 image_filename 生成完整的 icon URL
+    icon_url = None
+    if thumbnail_filename:
+        icon_url = IMAGE_BASE_URL + "/" + thumbnail_filename
 
     for img_data in images_data_list:
         img_score = img_data.get("score", score)
@@ -308,13 +295,11 @@ def add_event():
     cursor = None
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor) # 使用 RealDictCursor
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-        # 定义时间窗口（当前分钟）
         minute_start = event_time.replace(second=0, microsecond=0)
         minute_end = minute_start + timedelta(minutes=1)
 
-        # 查找在同一分钟、同一设备、同一风险类型的现有事件，并锁定行以防并发写入
         sql_find = """
         SELECT id, score, deductions, image_count 
         FROM events 
@@ -334,7 +319,6 @@ def add_event():
             print(f"Merging into existing event_id: {existing_event['id']}")
             event_id_to_use = existing_event['id']
             
-            # 计算合并后的新值
             total_image_count = existing_event['image_count'] + new_image_count
             final_score = min(existing_event['score'], request_lowest_score)
             
@@ -342,7 +326,7 @@ def add_event():
             final_deductions_set = set(existing_deductions) | request_deductions_set
             final_deductions_json = json.dumps(list(final_deductions_set))
 
-            # 更新主事件
+            # [MODIFIED] 更新时不需要更新 icon_url，因为它和 image_filename 一致
             sql_update = """
             UPDATE events 
             SET image_count = %s, score = %s, deductions = %s, status = 'new'
@@ -354,16 +338,17 @@ def add_event():
             # --- 3b. 创建新事件 ---
             print("Creating new event.")
             sql_event = """
-            INSERT INTO events (camera_id, equipment_type, event_time, risk_type, score, image_filename, image_count, status, deductions)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+            INSERT INTO events (camera_id, equipment_type, event_time, risk_type, score, image_filename, icon_url, image_count, status, deductions)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
             """
             cursor.execute(sql_event, (
                 camera_id, equipment_type, event_time, risk_type, 
-                request_lowest_score, # 使用请求中的最低分
-                thumbnail_filename, # 使用第一张图作为缩略图
-                new_image_count, # 本次请求的图片数
+                request_lowest_score,
+                thumbnail_filename,
+                icon_url,  # [NEW] 插入 icon_url
+                new_image_count,
                 'new', 
-                request_deductions_json # 本次请求的扣分项
+                request_deductions_json
             ))
             event_id_to_use = cursor.fetchone()['id']
 
@@ -372,7 +357,6 @@ def add_event():
         image_records = []
         
         for i, img_data in enumerate(images_data_list):
-            # 模拟时间戳（如果AI脚本没有提供单独的时间戳）
             img_time = event_time + timedelta(seconds=i) 
             img_url = image_url_prefix + "/" + img_data.get("filename", f"event_{event_id_to_use}_{i}.jpg")
             img_score = img_data.get("score", score)
@@ -403,12 +387,14 @@ def add_event():
 @app.route('/api/events', methods=['GET'])
 @token_required
 def get_events(current_user_id):
-    # ... (函数内容保持不变) ...
+    """
+    [MODIFIED] 返回事件列表，现在包含 icon_url 和 image_url（拼接完整路径）
+    """
     try:
         page = int(request.args.get('page', 1))
         limit = int(request.args.get('limit', 20))
-        start_date_str = request.args.get('start_date') # YYYY-MM-DD
-        end_date_str = request.args.get('end_date') # YYYY-MM-DD
+        start_date_str = request.args.get('start_date')
+        end_date_str = request.args.get('end_date')
         offset = (page - 1) * limit
     except ValueError:
         return jsonify({"success": False, "message": "无效的分页参数"}), 400
@@ -417,43 +403,54 @@ def get_events(current_user_id):
     cursor = None
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor) # 使用 RealDictCursor
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-        # 构建基础查询
-        # [MODIFIED] 字段名 `image_filename` 映射为 `thumbnail_url` 以匹配App需求
+        # [MODIFIED] 在 GET 时动态拼接 icon_url，直接使用 image_filename
         sql_data = """
-        SELECT id, camera_id, equipment_type, event_time, risk_type, score, image_filename AS thumbnail_url, status
+        SELECT 
+            id, 
+            camera_id, 
+            equipment_type, 
+            event_time, 
+            risk_type, 
+            score, 
+            CASE 
+                WHEN image_filename IS NOT NULL THEN %s || '/' || image_filename
+                ELSE NULL
+            END AS image_url,
+            CASE 
+                WHEN image_filename IS NOT NULL THEN %s || '/' || image_filename
+                ELSE NULL
+            END AS icon_url,
+            status
         FROM events
         """
         sql_count = "SELECT COUNT(*) FROM events"
         
-        # 添加筛选条件
-        conditions = ["risk_type = 'abnormal'"] # 默认只显示 "abnormal"
-        params = []
+        conditions = ["risk_type = 'abnormal'"]
+        params = [IMAGE_BASE_URL, IMAGE_BASE_URL]  # [MODIFIED] 需要两个 IMAGE_BASE_URL（image_url 和 icon_url）
         
         if start_date_str:
             conditions.append("event_time >= %s")
             params.append(start_date_str)
         
         if end_date_str:
-            # 包含当天，所以查询到 23:59:59
             conditions.append("event_time <= %s")
             params.append(end_date_str + " 23:59:59")
         
         if conditions:
             sql_data += " WHERE " + " AND ".join(conditions)
-            sql_count += " WHERE " + " AND ".join(conditions)
+            sql_count += " WHERE " + " AND ".join(conditions[0:])  # count 查询不需要 IMAGE_BASE_URL
         
-        # 添加排序和分页
         sql_data += " ORDER BY event_time DESC LIMIT %s OFFSET %s"
         params.extend([limit, offset])
         
-        # 执行数据查询
         cursor.execute(sql_data, tuple(params))
         events = cursor.fetchall()
 
-        # 执行总数查询 (移除分页参数)
-        cursor.execute(sql_count, tuple(params[:-2])) # 移除 limit 和 offset
+        # count 查询需要移除两个 IMAGE_BASE_URL 参数
+        count_params = [p for p in params[2:] if p not in [limit, offset]]
+        cursor.execute(sql_count, tuple(count_params))
         total_events = cursor.fetchone()['count']
 
         return jsonify({
@@ -478,7 +475,9 @@ def get_events(current_user_id):
 @app.route('/api/events/<int:event_id>', methods=['GET'])
 @token_required
 def get_event_detail(current_user_id, event_id):
-    # ... (函数内容保持不变) ...
+    """
+    [MODIFIED] 返回事件详情，包含 icon_url
+    """
     print(f"🔵 API: Fetching event detail for event_id: {event_id}")
     
     conn = None
@@ -487,18 +486,22 @@ def get_event_detail(current_user_id, event_id):
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-        # 步骤 1: 获取主事件信息
+        # [MODIFIED] 在 GET 时动态拼接 icon_url，使用 image_filename
         sql_event = """
         SELECT 
             id, 
             camera_id, 
             equipment_type AS category, 
             score, 
-            event_time AS timestamp
+            event_time AS timestamp,
+            CASE 
+                WHEN image_filename IS NOT NULL THEN %s || '/' || image_filename
+                ELSE NULL
+            END AS icon_url
         FROM events
         WHERE id = %s;
         """
-        cursor.execute(sql_event, (event_id,))
+        cursor.execute(sql_event, (IMAGE_BASE_URL, event_id))
         event_detail = cursor.fetchone()
 
         print(f"📄 Event detail: {event_detail}")
@@ -507,11 +510,8 @@ def get_event_detail(current_user_id, event_id):
             print(f"❌ Event {event_id} not found")
             return jsonify({"success": False, "message": "未找到指定 ID 的事件"}), 404
 
-        # 转换为普通字典
         event_detail = dict(event_detail)
 
-        # 步骤 2: 获取所有关联的图片信息
-        # [FIX] 修改 COALESCE 的类型为 jsonb
         sql_images = """
         SELECT 
             id AS image_id, 
@@ -528,28 +528,22 @@ def get_event_detail(current_user_id, event_id):
 
         print(f"📸 Found {len(images)} images")
 
-        # 转换图片数据
         processed_images = []
         for img in images:
             img_dict = dict(img)
             
-            # JSONB 类型会被 psycopg2 自动转换为 Python list/dict
-            # 但还是做一下安全检查
             deductions = img_dict.get('deduction_items')
             if not isinstance(deductions, list):
                 img_dict['deduction_items'] = []
             
-            # 确保 timestamp 是 ISO 格式字符串
             if isinstance(img_dict.get('timestamp'), datetime):
                 img_dict['timestamp'] = img_dict['timestamp'].isoformat()
             
             processed_images.append(img_dict)
 
-        # 步骤 3: 组合响应
         event_detail['images'] = processed_images
         event_detail['image_count'] = len(processed_images)
         
-        # 确保主 timestamp 也是 ISO 格式
         if isinstance(event_detail.get('timestamp'), datetime):
             event_detail['timestamp'] = event_detail['timestamp'].isoformat()
 
@@ -572,11 +566,9 @@ def get_event_detail(current_user_id, event_id):
 @app.route('/api/feedback', methods=['POST'])
 @token_required
 def add_feedback(current_user_id):
-    # ... (函数内容保持不变) ...
     data = request.get_json()
-    # event_id = data.get('event_id')
     image_id = data.get('image_id')
-    reason = data.get('reason') # [NEW] 从 App 接收
+    reason = data.get('reason')
     notes = data.get('notes')
 
     if not image_id or not reason:
@@ -588,10 +580,6 @@ def add_feedback(current_user_id):
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # [FIXED] 修正了 SQL 语句：
-        # 1. 移除了 "INSERT INTO feedback (" 后的多余逗号。
-        # 2. 将 VALUES 中的占位符数量从 6 个减少到 5 个，以匹配参数数量。
-        # 3. 移除了 event_id，因为 feedback 表是通过 image_id 关联的。
         sql = """
         INSERT INTO feedback (image_id, user_id, reason, notes, feedback_time)
         VALUES (%s, %s, %s, %s, %s) RETURNING id;
@@ -601,7 +589,6 @@ def add_feedback(current_user_id):
         ))
         feedback_id = cursor.fetchone()[0]
         
-        # (可选) 更新 event_images 表中的状态
         cursor.execute("UPDATE event_images SET has_feedback = true WHERE id = %s", (image_id,))
         
         conn.commit()
@@ -622,7 +609,6 @@ def add_feedback(current_user_id):
 @app.route('/api/reports', methods=['GET'])
 @token_required
 def get_periodic_report(current_user_id):
-    # ... (函数内容保持不变) ...
     report_type = request.args.get('type', 'monthly')
     
     conn = None
@@ -630,10 +616,6 @@ def get_periodic_report(current_user_id):
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        # [MODIFIED] 真实的数据库查询
-        # 假设 `reports` 表由一个单独的脚本预先计算并填充
-        # 我们只获取 App 需要的最新一份报告
-        # `summary_data` 列必须存储 `api_specification.md` 中定义的完整 JSON 结构
         sql = """
         SELECT summary_data 
         FROM reports
@@ -645,11 +627,8 @@ def get_periodic_report(current_user_id):
         report = cursor.fetchone()
         
         if report and report['summary_data']:
-            # `summary_data` 已经是 JSON (或 psycopg2 自动转换的 dict)
-            # 我们需要确保它符合App所需的完整结构
             report_data = report['summary_data']
             
-            # 确保 `success` 和 `report_type` 字段存在
             if not isinstance(report_data, dict):
                  report_data = json.loads(report_data)
                  
@@ -658,7 +637,6 @@ def get_periodic_report(current_user_id):
             
             return jsonify(report_data)
         else:
-            # 如果数据库中没有，返回一个空的或默认的结构
             return jsonify({"success": False, "message": "未找到可用的定期报告"}), 404
 
     except (Exception, psycopg2.DatabaseError) as error:
@@ -677,8 +655,6 @@ if __name__ == '__main__':
     print(f"--- Flask API サーバーをポート {port} で起動します ---")
     print(f"Listening on 0.0.0.0:{port}")
 
-    
-    # 检查是否在 Render.com 环境中 (Render 会设置 RENDER 环境变量)
     is_production = 'RENDER' in os.environ
     
     if is_production:
@@ -687,6 +663,4 @@ if __name__ == '__main__':
         serve(app, host='0.0.0.0', port=port)
     else:
         print("--- Flask 開発サーバー (Debug) を使用します ---")
-        # 本地开发时，debug=True 可以提供热重载和更详细的错误
         app.run(host='0.0.0.0', port=port, debug=True)
-
