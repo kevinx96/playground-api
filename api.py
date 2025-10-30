@@ -4,7 +4,7 @@ import json
 from flask import Flask, jsonify, request
 from datetime import datetime, timedelta # [MODIFIED] 导入 timedelta
 from flask_bcrypt import Bcrypt # [SECURITY] 导入 Bcrypt
-from psycopg2.extras import RealDictCursor # [IMPROVEMENT] 导入 RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_batch # [MODIFIED] 导入 execute_batch
 import decimal # [FIX] 用于处理 Decimal 类型
 import jwt # [SECURITY] 导入 JWT 用于 Token
 from functools import wraps # [SECURITY] 导入 wraps 用于装饰器
@@ -92,9 +92,7 @@ def home():
 
 @app.route('/api/auth/register', methods=['POST'])
 def register_user():
-    """
-    [SECURITY UPGRADE] 使用 Bcrypt 哈希密码的用户注册
-    """
+    # ... (函数内容保持不变) ...
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
@@ -139,9 +137,7 @@ def register_user():
 
 @app.route('/api/auth/login', methods=['POST'])
 def login_user():
-    """
-    [SECURITY UPGRADE] 使用 Bcrypt 校验密码并返回 JWT Token
-    """
+    # ... (函数内容保持不变) ...
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
@@ -195,9 +191,7 @@ def login_user():
 @app.route('/api/cameras', methods=['GET'])
 @token_required
 def get_cameras(current_user_id):
-    """
-    [MODIFIED] 获取摄像头列表 (已移除占位逻辑)
-    """
+    # ... (函数内容保持不变) ...
     conn = None
     try:
         conn = get_db_connection()
@@ -222,9 +216,7 @@ def get_cameras(current_user_id):
 @app.route('/api/cameras/<int:camera_id>/stream', methods=['GET'])
 @token_required
 def get_camera_stream(current_user_id, camera_id):
-    """
-    [NEW ENDPOINT] 获取单个摄像头的视频流 URL (根据计划书)
-    """
+    # ... (函数内容保持不变) ...
     conn = None
     try:
         conn = get_db_connection()
@@ -255,14 +247,13 @@ def get_camera_stream(current_user_id, camera_id):
 @app.route('/api/events', methods=['POST'])
 def add_event():
     """
-    接收来自本地分析脚本的危险事件数据 (来自用户提供的 api.py)
+    [MODIFIED] 接收AI脚本的事件数据，并根据分钟/设备类型自动合并事件。
     """
-    # TODO: 考虑为这个端点添加一个 API 密钥或 IP 白名单，防止公网滥用
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "未提供输入数据"}), 400
 
-    # --- 从 AI 脚本获取数据 ---
+    # --- 1. 解析和验证来自 AI 脚本的数据 ---
     camera_id = data.get('camera_id', 0)
     equipment_type = data.get('equipment_type')
     timestamp_str = data.get('timestamp')
@@ -270,15 +261,9 @@ def add_event():
     score = data.get('score') # 整个事件的（例如最低）分数
     image_filename = data.get('image_filename') # 缩略图
     deductions_list = data.get('deductions', []) # 整个事件的扣分项
-    
-    # [IMPORTANT] AI 脚本必须提供每张图片的详细信息
-    # 这是支持App详情页功能的关键
-    # 计划书 1.1 节提到了 "5枚"，但JSON示例中没有
-    # 我们假设 AI 脚本会发送一个 `images_data` 列表
-    # 格式: [ { "filename": "img_01.jpg", "score": 40, "deductions": ["..."] }, ... ]
     images_data_list = data.get('images_data', [])
     
-    # 兼容旧格式：如果只提供了 image_filename
+    # 兼容旧格式：如果只提供了 image_filename (代表只有一张图)
     if image_filename and not images_data_list:
         images_data_list = [{
             "filename": image_filename,
@@ -292,6 +277,9 @@ def add_event():
     
     if risk_type not in ["normal", "abnormal"]:
         return jsonify({"success": False, "message": "无效的 risk_type 值"}), 400
+    
+    if not images_data_list:
+        return jsonify({"success": False, "message": "未提供任何图像数据 (images_data 或 image_filename)"}), 400
 
     try:
         event_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
@@ -301,59 +289,107 @@ def add_event():
         except ValueError:
             return jsonify({"success": False, "message": "无效的时间戳格式"}), 400
 
+    # --- 2. 准备新数据（用于插入或更新） ---
+    new_image_count = len(images_data_list)
+    request_lowest_score = score # 默认为请求中的 "score"
+    request_deductions_set = set(deductions_list)
+    thumbnail_filename = image_filename or images_data_list[0].get("filename")
+
+    for img_data in images_data_list:
+        img_score = img_data.get("score", score)
+        if img_score < request_lowest_score:
+            request_lowest_score = img_score
+        request_deductions_set.update(img_data.get("deductions", []))
+
+    request_deductions_json = json.dumps(list(request_deductions_set))
+
+    # --- 3. 查找或创建事件（事务） ---
     conn = None
     cursor = None
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=RealDictCursor) # 使用 RealDictCursor
 
-        deductions_json = json.dumps(deductions_list)
-        image_count = len(images_data_list)
-        
-        # 步骤 1: 插入主 event 记录
-        sql_event = """
-        INSERT INTO events (camera_id, equipment_type, event_time, risk_type, score, image_filename, image_count, status, deductions)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+        # 定义时间窗口（当前分钟）
+        minute_start = event_time.replace(second=0, microsecond=0)
+        minute_end = minute_start + timedelta(minutes=1)
+
+        # 查找在同一分钟、同一设备、同一风险类型的现有事件，并锁定行以防并发写入
+        sql_find = """
+        SELECT id, score, deductions, image_count 
+        FROM events 
+        WHERE equipment_type = %s 
+          AND event_time >= %s 
+          AND event_time < %s 
+          AND risk_type = %s 
+        LIMIT 1 FOR UPDATE;
         """
-        cursor.execute(sql_event, (
-            camera_id, equipment_type, event_time, risk_type, score,
-            image_filename, image_count, 'new', deductions_json
-        ))
-        event_id = cursor.fetchone()[0]
+        cursor.execute(sql_find, (equipment_type, minute_start, minute_end, risk_type))
+        existing_event = cursor.fetchone()
         
-        # 步骤 2: 插入关联的图片 (根据计划书的 `event_images` 表)
-        if image_count > 0:
-            # TODO: 这里的 `image_url_prefix` 应根据您的文件存储策略修改
-            # [MODIFIED] 使用在文件顶部定义的 IMAGE_BASE_URL
-            image_url_prefix = IMAGE_BASE_URL
+        event_id_to_use = None
+
+        if existing_event:
+            # --- 3a. 合并到现有事件 ---
+            print(f"Merging into existing event_id: {existing_event['id']}")
+            event_id_to_use = existing_event['id']
             
-            image_records = []
-            for i, img_data in enumerate(images_data_list):
-                img_time = event_time + timedelta(seconds=i - int(image_count / 2)) # 模拟时间
-                img_url = image_url_prefix +"/"+ img_data.get("filename", f"event_{event_id}_{i}.jpg")
-                img_score = img_data.get("score", score) # 使用单张图片分数，否则回退到事件分数
-                img_deductions = json.dumps(img_data.get("deductions", [])) # 使用单张图片扣分项
+            # 计算合并后的新值
+            total_image_count = existing_event['image_count'] + new_image_count
+            final_score = min(existing_event['score'], request_lowest_score)
+            
+            existing_deductions = existing_event['deductions'] or []
+            final_deductions_set = set(existing_deductions) | request_deductions_set
+            final_deductions_json = json.dumps(list(final_deductions_set))
 
-                # 假设 event_images 表结构 (event_id, image_url, timestamp, score, deduction_items)
-                # [MODIFIED] 插入我们建议的新字段 score 和 deductions
-                image_records.append((event_id, img_url, img_time, img_score, img_deductions))
-
-            sql_images = """
-            INSERT INTO event_images (event_id, image_url, "timestamp", score, deduction_items)
-            VALUES (%s, %s, %s, %s, %s);
+            # 更新主事件
+            sql_update = """
+            UPDATE events 
+            SET image_count = %s, score = %s, deductions = %s, status = 'new'
+            WHERE id = %s;
             """
-            # [IMPROVEMENT] 使用 executemany 进行批量插入
-            from psycopg2.extras import execute_batch
-            execute_batch(cursor, sql_images, image_records)
+            cursor.execute(sql_update, (total_image_count, final_score, final_deductions_json, event_id_to_use))
+            
+        else:
+            # --- 3b. 创建新事件 ---
+            print("Creating new event.")
+            sql_event = """
+            INSERT INTO events (camera_id, equipment_type, event_time, risk_type, score, image_filename, image_count, status, deductions)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+            """
+            cursor.execute(sql_event, (
+                camera_id, equipment_type, event_time, risk_type, 
+                request_lowest_score, # 使用请求中的最低分
+                thumbnail_filename, # 使用第一张图作为缩略图
+                new_image_count, # 本次请求的图片数
+                'new', 
+                request_deductions_json # 本次请求的扣分项
+            ))
+            event_id_to_use = cursor.fetchone()['id']
 
+        # --- 4. 插入图片详情（对合并或新建都执行） ---
+        image_url_prefix = IMAGE_BASE_URL
+        image_records = []
+        
+        for i, img_data in enumerate(images_data_list):
+            # 模拟时间戳（如果AI脚本没有提供单独的时间戳）
+            img_time = event_time + timedelta(seconds=i) 
+            img_url = image_url_prefix + "/" + img_data.get("filename", f"event_{event_id_to_use}_{i}.jpg")
+            img_score = img_data.get("score", score)
+            img_deductions = json.dumps(img_data.get("deductions", []))
+
+            image_records.append((event_id_to_use, img_url, img_time, img_score, img_deductions))
+
+        sql_images = """
+        INSERT INTO event_images (event_id, image_url, "timestamp", score, deduction_items)
+        VALUES (%s, %s, %s, %s, %s);
+        """
+        execute_batch(cursor, sql_images, image_records)
+
+        # --- 5. 提交事务 ---
         conn.commit()
 
-        if risk_type == "abnormal":
-            print(f"事件 {event_id} ({equipment_type}) 已记录为 abnormal，可以触发警报。")
-        else:
-            print(f"事件 {event_id} ({equipment_type}) 已记录为 normal。")
-
-        return jsonify({"success": True, "message": "事件成功添加", "event_id": event_id}), 201
+        return jsonify({"success": True, "message": "事件成功处理", "event_id": event_id_to_use}), 201
 
     except (Exception, psycopg2.DatabaseError) as error:
         if conn: conn.rollback()
@@ -367,9 +403,7 @@ def add_event():
 @app.route('/api/events', methods=['GET'])
 @token_required
 def get_events(current_user_id):
-    """
-    [MODIFIED] 获取事件历史记录，增加了日期筛选功能 (已连接DB)
-    """
+    # ... (函数内容保持不变) ...
     try:
         page = int(request.args.get('page', 1))
         limit = int(request.args.get('limit', 20))
@@ -444,9 +478,7 @@ def get_events(current_user_id):
 @app.route('/api/events/<int:event_id>', methods=['GET'])
 @token_required
 def get_event_detail(current_user_id, event_id):
-    """
-    [UPGRADED ENDPOINT] 获取单个事件的详细信息，并包含所有关联的图片 (已连接DB)
-    """
+    # ... (函数内容保持不变) ...
     print(f"🔵 API: Fetching event detail for event_id: {event_id}")
     
     conn = None
@@ -540,9 +572,7 @@ def get_event_detail(current_user_id, event_id):
 @app.route('/api/feedback', methods=['POST'])
 @token_required
 def add_feedback(current_user_id):
-    """
-    [NEW ENDPOINT] 接收来自 App 的误检测报告 (已连接DB)
-    """
+    # ... (函数内容保持不变) ...
     data = request.get_json()
     # event_id = data.get('event_id')
     image_id = data.get('image_id')
@@ -550,7 +580,7 @@ def add_feedback(current_user_id):
     notes = data.get('notes')
 
     if not image_id or not reason:
-        return jsonify({"success": False, "message": "缺少必需字段 (event_id, image_id, reason)"}), 400
+        return jsonify({"success": False, "message": "缺少必需字段 (image_id, reason)"}), 400
 
     conn = None
     cursor = None
@@ -558,7 +588,10 @@ def add_feedback(current_user_id):
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # [MODIFIED] 假设 feedback 表已添加 `reason` 列
+        # [FIXED] 修正了 SQL 语句：
+        # 1. 移除了 "INSERT INTO feedback (" 后的多余逗号。
+        # 2. 将 VALUES 中的占位符数量从 6 个减少到 5 个，以匹配参数数量。
+        # 3. 移除了 event_id，因为 feedback 表是通过 image_id 关联的。
         sql = """
         INSERT INTO feedback (image_id, user_id, reason, notes, feedback_time)
         VALUES (%s, %s, %s, %s, %s) RETURNING id;
@@ -589,9 +622,7 @@ def add_feedback(current_user_id):
 @app.route('/api/reports', methods=['GET'])
 @token_required
 def get_periodic_report(current_user_id):
-    """
-    [MODIFIED] 获取定期报告数据 (已连接DB)
-    """
+    # ... (函数内容保持不变) ...
     report_type = request.args.get('type', 'monthly')
     
     conn = None
@@ -658,3 +689,4 @@ if __name__ == '__main__':
         print("--- Flask 開発サーバー (Debug) を使用します ---")
         # 本地开发时，debug=True 可以提供热重载和更详细的错误
         app.run(host='0.0.0.0', port=port, debug=True)
+
