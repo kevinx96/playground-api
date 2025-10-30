@@ -15,7 +15,11 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'my_dev_secret_key_please_change_me')
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
-IMAGE_BASE_URL = os.environ.get('IMAGE_BASE_URL', 'https://subdistichously-polliniferous-ileen.ngrok-free.dev')
+IMAGE_BASE_URL = os.environ.get('IMAGE_BASE_URL') 
+if not IMAGE_BASE_URL:
+    print("警告: 'IMAGE_BASE_URL' 环境变量未设置。HLS 和图片 URL 可能不正确。")
+    IMAGE_BASE_URL = "https://default-please-set-me.ngrok-free.dev" 
+
 bcrypt = Bcrypt(app)
 
 # --- 数据库辅助函数 ---
@@ -30,7 +34,6 @@ def get_db_connection():
         print(f"数据库连接失败: {e}")
         raise
 
-# [FIX] 自定义 JSON 编码器，用于处理 datetime 和 decimal
 class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, datetime):
@@ -43,9 +46,6 @@ app.json_encoder = CustomJSONEncoder
 
 # --- 认证装饰器 ---
 def token_required(f):
-    """
-    [SECURITY] 检查请求 Header 中是否包含有效 Token 的装饰器
-    """
     @wraps(f)
     def decorated(*args, **kwargs):
         token = None
@@ -79,7 +79,8 @@ def home():
     """根路径，返回欢迎信息"""
     return jsonify({
         "message": "安全摄像头项目 API 服务器",
-        "status": "运行中"
+        "status": "运行中",
+        "streaming_base_url": IMAGE_BASE_URL
     })
 
 # --- 认证 Endpoints ---
@@ -174,52 +175,58 @@ def login_user():
 
 # --- 摄像头 Endpoints ---
 
+# [MODIFIED] 摄像头注册路由
 @app.route('/api/cameras/register', methods=['POST'])
 def register_camera():
     """
-    [NEW] 接收来自 live_analysis 脚本的摄像头注册请求。
-    此端点是公开的，不需要 Token。
-    它会清空现有摄像头并注册新的摄像头。
+    [MODIFIED] 接收来自本地脚本的摄像头数据。
+    使用 UPSERT (UPDATE or INSERT) 逻辑，不再使用 TRUNCATE。
+    这会保留所有现有的事件数据。
     """
+    # 这是一个内部端点，不需要 token
     data = request.get_json()
-    name = data.get('name')
-    hls_filename = data.get('hls_filename') # 脚本发送 'live.m3u8'
+    if not data:
+        return jsonify({"success": False, "message": "No data provided"}), 400
 
-    if not name or not hls_filename:
-        return jsonify({"success": False, "message": "缺少 name 或 hls_filename 字段"}), 400
+    # 你的脚本发送 'camera_id_logical' = 1
+    logical_id = data.get('camera_id_logical', 1) 
+    cam_name = data.get('name', 'Default Camera')
+    hls_filename = data.get('hls_filename')
 
+    if not hls_filename:
+        return jsonify({"success": False, "message": "hls_filename is required"}), 400
+    
+    if not IMAGE_BASE_URL:
+         print("CRITICAL ERROR: IMAGE_BASE_URL is not set in environment.")
+         return jsonify({"success": False, "message": "Server configuration error: IMAGE_BASE_URL not set"}), 500
+
+    # 拼接完整的 HLS URL
+    stream_url = IMAGE_BASE_URL.rstrip('/') + '/' + hls_filename.lstrip('/')
+    
     conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # 1. TRUNCATE aS REQUESTED: 清空 cameras 表，CASCADE 会清空所有引用的外键（如果设置了）
-        print(f"[Camera Register] 清空 'cameras' 表...")
-        cursor.execute("TRUNCATE cameras RESTART IDENTITY CASCADE;")
-        
-        # 2. CONSTRUCT URL: 拼接 URL
-        # e.g., "https://...ngrok.dev" + "/" + "live.m3u8"
-        stream_url = IMAGE_BASE_URL.rstrip('/') + '/' + hls_filename.lstrip('/')
-        print(f"[Camera Register] 构造的 Stream URL: {stream_url}")
-
-        # 3. INSERT: 插入新摄像头，ID 将由数据库自动设为 1
-        sql_insert = """
-        INSERT INTO cameras (name, stream_url, status, is_active) 
-        VALUES (%s, %s, 'online', true) 
-        RETURNING id;
+        # [NEW] 使用 UPSERT (INSERT ... ON CONFLICT DO UPDATE)
+        # 这会尝试插入 id=1 的摄像头。如果 id=1 已存在，它会执行 UPDATE。
+        sql_upsert = """
+        INSERT INTO cameras (id, name, stream_url, status, is_active)
+        VALUES (%s, %s, %s, 'online', true)
+        ON CONFLICT (id) DO UPDATE SET
+            name = EXCLUDED.name,
+            stream_url = EXCLUDED.stream_url,
+            status = 'online',
+            is_active = true;
         """
-        cursor.execute(sql_insert, (name, stream_url))
-        new_id = cursor.fetchone()[0]
+        
+        cursor.execute(sql_upsert, (logical_id, cam_name, stream_url))
         
         conn.commit()
-        print(f"[Camera Register] 成功注册新摄像头, ID: {new_id}")
 
-        return jsonify({
-            "success": True, 
-            "message": "摄像头注册成功", 
-            "new_camera_id": new_id,
-            "registered_stream_url": stream_url
-        }), 201
+        print(f"Camera {logical_id} was successfully registered/updated with URL: {stream_url}")
+        return jsonify({"success": True, "message": f"Camera {logical_id} registered/updated."}), 201
 
     except (Exception, psycopg2.DatabaseError) as error:
         if conn: conn.rollback()
@@ -227,22 +234,19 @@ def register_camera():
         return jsonify({"success": False, "message": f"数据库错误: {str(error)}"}), 500
     finally:
         if conn:
-            if 'cursor' in locals() and cursor:
-                cursor.close()
+            if cursor: cursor.close()
             conn.close()
 
 
 @app.route('/api/cameras', methods=['GET'])
 @token_required
 def get_cameras(current_user_id):
-    """
-    [UNCHANGED] App 获取摄像头列表 (受 Token 保护)
-    """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
+        # [MODIFIED] 不再查询 stream_url，App 应该使用 /api/cameras/<id>/stream
         cursor.execute("SELECT id, name, status FROM cameras WHERE is_active = true ORDER BY name ASC")
         cameras = cursor.fetchall()
         
@@ -260,15 +264,12 @@ def get_cameras(current_user_id):
 @app.route('/api/cameras/<int:camera_id>/stream', methods=['GET'])
 @token_required
 def get_camera_stream(current_user_id, camera_id):
-    """
-    [UNCHANGED] App 获取指定摄像头的 HLS URL (受 Token 保护)
-    """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        # [MODIFIED] 确保我们查询的是 stream_url (即拼接好的 HLS URL)
+        # 你的 APP 设计书 [cite:`総計画書1.1 (1).docx`] 指出此端点用于获取 stream_url
         cursor.execute("SELECT stream_url FROM cameras WHERE id = %s AND is_active = true", (camera_id,))
         camera = cursor.fetchone()
         
@@ -294,39 +295,38 @@ def get_camera_stream(current_user_id, camera_id):
 @app.route('/api/event/submit', methods=['POST'])
 def add_event():
     """
-    [UNCHANGED] 接收AI脚本的事件数据。
-    (现在 camera_id 应该会是 1，可以正常工作了)
+    [MODIFIED] 接收AI脚本的事件数据。
     """
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "未提供输入数据"}), 400
 
     # --- 1. 解析和验证来自 AI 脚本的数据 ---
-    camera_id = data.get('camera_id', 0)
+    camera_id = data.get('camera_id') # 应该是 1
     equipment_type = data.get('equipment_type')
     timestamp_str = data.get('timestamp')
     risk_type = data.get('risk_type')
     score = data.get('score')
-    image_filename = data.get('image_filename')
+    image_filename = data.get('image_filename') # 单个文件名
     deductions_list = data.get('deductions', [])
-    images_data_list = data.get('images_data', [])
     
-    if image_filename and not images_data_list:
-        images_data_list = [{
-            "filename": image_filename,
-            "score": score,
-            "deductions": deductions_list
-        }]
+    # 你的脚本 [cite:`live_analysis_v2.py`] 只发送单个 filename 和 deductions
+    images_data_list = [{
+        "filename": image_filename,
+        "score": score,
+        "deductions": deductions_list
+    }] if image_filename else []
 
-    if not all([equipment_type, timestamp_str, risk_type, score is not None]):
-        missing = [f for f in ['equipment_type', 'timestamp', 'risk_type', 'score'] if not data.get(f)]
+
+    if not all([camera_id is not None, equipment_type, timestamp_str, risk_type, score is not None]):
+        missing = [f for f in ['camera_id', 'equipment_type', 'timestamp', 'risk_type', 'score'] if data.get(f) is None]
         return jsonify({"success": False, "message": f"缺少必需字段: {', '.join(missing)}"}), 400
     
     if risk_type not in ["normal", "abnormal"]:
         return jsonify({"success": False, "message": "无效的 risk_type 值"}), 400
     
     if not images_data_list:
-        return jsonify({"success": False, "message": "未提供任何图像数据 (images_data 或 image_filename)"}), 400
+        return jsonify({"success": False, "message": "未提供 image_filename"}), 400
 
     try:
         event_time = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
@@ -340,19 +340,12 @@ def add_event():
     new_image_count = len(images_data_list)
     request_lowest_score = score
     request_deductions_set = set(deductions_list)
-    thumbnail_filename = image_filename or images_data_list[0].get("filename")
+    thumbnail_filename = image_filename
     
     # [NEW] 使用 image_filename 生成完整的 icon URL
     icon_url = None
     if thumbnail_filename:
-        # 确保拼接 URL 时只有一个 '/'
         icon_url = IMAGE_BASE_URL.rstrip('/') + '/' + thumbnail_filename.lstrip('/')
-
-    for img_data in images_data_list:
-        img_score = img_data.get("score", score)
-        if img_score < request_lowest_score:
-            request_lowest_score = img_score
-        request_deductions_set.update(img_data.get("deductions", []))
 
     request_deductions_json = json.dumps(list(request_deductions_set))
 
@@ -392,7 +385,6 @@ def add_event():
             final_deductions_set = set(existing_deductions) | request_deductions_set
             final_deductions_json = json.dumps(list(final_deductions_set))
 
-            # [MODIFIED] 更新时不需要更新 icon_url，因为它和 image_filename 一致
             sql_update = """
             UPDATE events 
             SET image_count = %s, score = %s, deductions = %s, status = 'new'
@@ -411,7 +403,7 @@ def add_event():
                 camera_id, equipment_type, event_time, risk_type, 
                 request_lowest_score,
                 thumbnail_filename,
-                icon_url,  # [NEW] 插入 icon_url
+                icon_url,
                 new_image_count,
                 'new', 
                 request_deductions_json
@@ -444,10 +436,7 @@ def add_event():
     except (Exception, psycopg2.DatabaseError) as error:
         if conn: conn.rollback()
         print(f"数据库错误 (Add Event): {error}")
-        
-        # [FIX] 撤销自定义的、令人困惑的 camera_id 错误处理。
-        # 直接返回原始的数据库错误，这更有助于调试真正的问题
-        # (即 /api/cameras/register 为何没有成功创建 id=1 的摄像头)。
+        # [FIX] 撤销了自定义的 camera_id 错误，直接返回原始数据库错误
         return jsonify({"success": False, "message": f"数据库错误: {str(error)}"}), 500
     finally:
         if conn:
@@ -458,7 +447,7 @@ def add_event():
 @token_required
 def get_events(current_user_id):
     """
-    [MODIFIED] 返回事件列表，现在包含 icon_url 和 image_url（拼接完整路径）
+    [MODIFIED] 返回事件列表，现在拼接 icon_url 和 image_url
     """
     try:
         page = int(request.args.get('page', 1))
@@ -475,9 +464,9 @@ def get_events(current_user_id):
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
+        # 在 GET 时动态拼接 icon_url 和 image_url
         base_url = IMAGE_BASE_URL.rstrip('/')
-
-        # [MODIFIED] 在 GET 时动态拼接 icon_url，直接使用 image_filename
+        
         sql_data = """
         SELECT 
             id, 
@@ -500,7 +489,7 @@ def get_events(current_user_id):
         sql_count = "SELECT COUNT(*) FROM events"
         
         conditions = ["risk_type = 'abnormal'"]
-        params = [base_url, base_url]  # [MODIFIED] 需要两个 IMAGE_BASE_URL（image_url 和 icon_url）
+        params = [base_url, base_url] 
         
         if start_date_str:
             conditions.append("event_time >= %s")
@@ -512,7 +501,7 @@ def get_events(current_user_id):
         
         if conditions:
             sql_data += " WHERE " + " AND ".join(conditions)
-            sql_count += " WHERE " + " AND ".join(conditions[0:])  # count 查询不需要 base_url
+            sql_count += " WHERE " + " AND ".join(conditions[0:])
         
         sql_data += " ORDER BY event_time DESC LIMIT %s OFFSET %s"
         params.extend([limit, offset])
@@ -520,7 +509,7 @@ def get_events(current_user_id):
         cursor.execute(sql_data, tuple(params))
         events = cursor.fetchall()
 
-        # count 查询需要移除两个 base_url 参数
+        # count 查询需要移除 base_url 参数
         count_params = [p for p in params[2:] if p not in [limit, offset]]
         cursor.execute(sql_count, tuple(count_params))
         total_events = cursor.fetchone()['count']
@@ -547,11 +536,6 @@ def get_events(current_user_id):
 @app.route('/api/events/<int:event_id>', methods=['GET'])
 @token_required
 def get_event_detail(current_user_id, event_id):
-    """
-    [MODIFIED] 返回事件详情，包含 icon_url
-    """
-    print(f"🔵 API: Fetching event detail for event_id: {event_id}")
-    
     conn = None
     cursor = None
     try:
@@ -560,7 +544,6 @@ def get_event_detail(current_user_id, event_id):
 
         base_url = IMAGE_BASE_URL.rstrip('/')
 
-        # [MODIFIED] 在 GET 时动态拼接 icon_url，使用 image_filename
         sql_event = """
         SELECT 
             id, 
@@ -578,10 +561,7 @@ def get_event_detail(current_user_id, event_id):
         cursor.execute(sql_event, (base_url, event_id))
         event_detail = cursor.fetchone()
 
-        print(f"📄 Event detail: {event_detail}")
-
         if not event_detail:
-            print(f"❌ Event {event_id} not found")
             return jsonify({"success": False, "message": "未找到指定 ID 的事件"}), 404
 
         event_detail = dict(event_detail)
@@ -590,17 +570,15 @@ def get_event_detail(current_user_id, event_id):
         SELECT 
             id AS image_id, 
             image_url, 
-            timestamp, 
+            "timestamp", 
             COALESCE(score, 0) AS score,
             COALESCE(deduction_items, '[]'::jsonb) AS deduction_items
         FROM event_images
         WHERE event_id = %s
-        ORDER BY timestamp ASC;
+        ORDER BY "timestamp" ASC;
         """
         cursor.execute(sql_images, (event_id,))
         images = cursor.fetchall()
-
-        print(f"📸 Found {len(images)} images")
 
         processed_images = []
         for img in images:
@@ -621,14 +599,10 @@ def get_event_detail(current_user_id, event_id):
         if isinstance(event_detail.get('timestamp'), datetime):
             event_detail['timestamp'] = event_detail['timestamp'].isoformat()
 
-        print(f"✅ Returning {len(processed_images)} images")
-
         return jsonify({"success": True, "data": event_detail})
 
     except (Exception, psycopg2.DatabaseError) as error:
-        print(f"❌ Database error: {error}")
-        import traceback
-        traceback.print_exc()
+        print(f"数据库错误 (Get Event Detail): {error}")
         return jsonify({"success": False, "message": f"数据库错误: {str(error)}"}), 500
     finally:
         if conn:
