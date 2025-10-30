@@ -330,7 +330,7 @@ def add_event():
             image_records = []
             for i, img_data in enumerate(images_data_list):
                 img_time = event_time + timedelta(seconds=i - int(image_count / 2)) # 模拟时间
-                img_url = image_url_prefix + img_data.get("filename", f"event_{event_id}_{i}.jpg")
+                img_url = image_url_prefix +"/"+ img_data.get("filename", f"event_{event_id}_{i}.jpg")
                 img_score = img_data.get("score", score) # 使用单张图片分数，否则回退到事件分数
                 img_deductions = json.dumps(img_data.get("deductions", [])) # 使用单张图片扣分项
 
