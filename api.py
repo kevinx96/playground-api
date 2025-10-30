@@ -544,7 +544,7 @@ def add_feedback(current_user_id):
     [NEW ENDPOINT] 接收来自 App 的误检测报告 (已连接DB)
     """
     data = request.get_json()
-    event_id = data.get('event_id')
+    # event_id = data.get('event_id')
     image_id = data.get('image_id')
     reason = data.get('reason') # [NEW] 从 App 接收
     notes = data.get('notes')
@@ -560,11 +560,11 @@ def add_feedback(current_user_id):
 
         # [MODIFIED] 假设 feedback 表已添加 `reason` 列
         sql = """
-        INSERT INTO feedback (event_id, image_id, user_id, reason, notes, feedback_time)
+        INSERT INTO feedback (, image_id, user_id, reason, notes, feedback_time)
         VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;
         """
         cursor.execute(sql, (
-            event_id, image_id, current_user_id, reason, notes, datetime.now()
+            image_id, current_user_id, reason, notes, datetime.now()
         ))
         feedback_id = cursor.fetchone()[0]
         
