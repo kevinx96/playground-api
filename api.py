@@ -174,9 +174,70 @@ def login_user():
 
 # --- 摄像头 Endpoints ---
 
+@app.route('/api/cameras/register', methods=['POST'])
+def register_camera():
+    """
+    [NEW] 接收来自 live_analysis 脚本的摄像头注册请求。
+    此端点是公开的，不需要 Token。
+    它会清空现有摄像头并注册新的摄像头。
+    """
+    data = request.get_json()
+    name = data.get('name')
+    hls_filename = data.get('hls_filename') # 脚本发送 'live.m3u8'
+
+    if not name or not hls_filename:
+        return jsonify({"success": False, "message": "缺少 name 或 hls_filename 字段"}), 400
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # 1. TRUNCATE aS REQUESTED: 清空 cameras 表，CASCADE 会清空所有引用的外键（如果设置了）
+        print(f"[Camera Register] 清空 'cameras' 表...")
+        cursor.execute("TRUNCATE cameras RESTART IDENTITY CASCADE;")
+        
+        # 2. CONSTRUCT URL: 拼接 URL
+        # e.g., "https://...ngrok.dev" + "/" + "live.m3u8"
+        stream_url = IMAGE_BASE_URL.rstrip('/') + '/' + hls_filename.lstrip('/')
+        print(f"[Camera Register] 构造的 Stream URL: {stream_url}")
+
+        # 3. INSERT: 插入新摄像头，ID 将由数据库自动设为 1
+        sql_insert = """
+        INSERT INTO cameras (name, stream_url, status, is_active) 
+        VALUES (%s, %s, 'online', true) 
+        RETURNING id;
+        """
+        cursor.execute(sql_insert, (name, stream_url))
+        new_id = cursor.fetchone()[0]
+        
+        conn.commit()
+        print(f"[Camera Register] 成功注册新摄像头, ID: {new_id}")
+
+        return jsonify({
+            "success": True, 
+            "message": "摄像头注册成功", 
+            "new_camera_id": new_id,
+            "registered_stream_url": stream_url
+        }), 201
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        if conn: conn.rollback()
+        print(f"数据库错误 (Register Camera): {error}")
+        return jsonify({"success": False, "message": f"数据库错误: {str(error)}"}), 500
+    finally:
+        if conn:
+            if 'cursor' in locals() and cursor:
+                cursor.close()
+            conn.close()
+
+
 @app.route('/api/cameras', methods=['GET'])
 @token_required
 def get_cameras(current_user_id):
+    """
+    [UNCHANGED] App 获取摄像头列表 (受 Token 保护)
+    """
     conn = None
     try:
         conn = get_db_connection()
@@ -199,11 +260,15 @@ def get_cameras(current_user_id):
 @app.route('/api/cameras/<int:camera_id>/stream', methods=['GET'])
 @token_required
 def get_camera_stream(current_user_id, camera_id):
+    """
+    [UNCHANGED] App 获取指定摄像头的 HLS URL (受 Token 保护)
+    """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
+        # [MODIFIED] 确保我们查询的是 stream_url (即拼接好的 HLS URL)
         cursor.execute("SELECT stream_url FROM cameras WHERE id = %s AND is_active = true", (camera_id,))
         camera = cursor.fetchone()
         
@@ -226,11 +291,11 @@ def get_camera_stream(current_user_id, camera_id):
 
 # --- 事件 (Events) Endpoints ---
 
-@app.route('/api/events', methods=['POST'])
+@app.route('/api/event/submit', methods=['POST'])
 def add_event():
     """
-    [MODIFIED] 接收AI脚本的事件数据，并根据分钟/设备类型自动合并事件。
-    icon_url 使用 image_filename 自动生成。
+    [UNCHANGED] 接收AI脚本的事件数据。
+    (现在 camera_id 应该会是 1，可以正常工作了)
     """
     data = request.get_json()
     if not data:
@@ -280,7 +345,8 @@ def add_event():
     # [NEW] 使用 image_filename 生成完整的 icon URL
     icon_url = None
     if thumbnail_filename:
-        icon_url = IMAGE_BASE_URL + "/" + thumbnail_filename
+        # 确保拼接 URL 时只有一个 '/'
+        icon_url = IMAGE_BASE_URL.rstrip('/') + '/' + thumbnail_filename.lstrip('/')
 
     for img_data in images_data_list:
         img_score = img_data.get("score", score)
@@ -353,12 +419,12 @@ def add_event():
             event_id_to_use = cursor.fetchone()['id']
 
         # --- 4. 插入图片详情（对合并或新建都执行） ---
-        image_url_prefix = IMAGE_BASE_URL
+        image_url_prefix = IMAGE_BASE_URL.rstrip('/')
         image_records = []
         
         for i, img_data in enumerate(images_data_list):
             img_time = event_time + timedelta(seconds=i) 
-            img_url = image_url_prefix + "/" + img_data.get("filename", f"event_{event_id_to_use}_{i}.jpg")
+            img_url = image_url_prefix + "/" + img_data.get("filename", f"event_{event_id_to_use}_{i}.jpg").lstrip('/')
             img_score = img_data.get("score", score)
             img_deductions = json.dumps(img_data.get("deductions", []))
 
@@ -378,6 +444,10 @@ def add_event():
     except (Exception, psycopg2.DatabaseError) as error:
         if conn: conn.rollback()
         print(f"数据库错误 (Add Event): {error}")
+        # 增加对外键错误的特殊提示
+        if "violates foreign key constraint" in str(error) and "camera_id" in str(error):
+             print(f"!!! 外键错误: 'camera_id' ({camera_id}) 在 'cameras' 表中不存在。")
+             return jsonify({"success": False, "message": f"数据库错误: 'camera_id' ({camera_id}) 无效。"}), 500
         return jsonify({"success": False, "message": f"数据库错误: {str(error)}"}), 500
     finally:
         if conn:
@@ -405,6 +475,8 @@ def get_events(current_user_id):
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
+        base_url = IMAGE_BASE_URL.rstrip('/')
+
         # [MODIFIED] 在 GET 时动态拼接 icon_url，直接使用 image_filename
         sql_data = """
         SELECT 
@@ -428,7 +500,7 @@ def get_events(current_user_id):
         sql_count = "SELECT COUNT(*) FROM events"
         
         conditions = ["risk_type = 'abnormal'"]
-        params = [IMAGE_BASE_URL, IMAGE_BASE_URL]  # [MODIFIED] 需要两个 IMAGE_BASE_URL（image_url 和 icon_url）
+        params = [base_url, base_url]  # [MODIFIED] 需要两个 IMAGE_BASE_URL（image_url 和 icon_url）
         
         if start_date_str:
             conditions.append("event_time >= %s")
@@ -440,7 +512,7 @@ def get_events(current_user_id):
         
         if conditions:
             sql_data += " WHERE " + " AND ".join(conditions)
-            sql_count += " WHERE " + " AND ".join(conditions[0:])  # count 查询不需要 IMAGE_BASE_URL
+            sql_count += " WHERE " + " AND ".join(conditions[0:])  # count 查询不需要 base_url
         
         sql_data += " ORDER BY event_time DESC LIMIT %s OFFSET %s"
         params.extend([limit, offset])
@@ -448,7 +520,7 @@ def get_events(current_user_id):
         cursor.execute(sql_data, tuple(params))
         events = cursor.fetchall()
 
-        # count 查询需要移除两个 IMAGE_BASE_URL 参数
+        # count 查询需要移除两个 base_url 参数
         count_params = [p for p in params[2:] if p not in [limit, offset]]
         cursor.execute(sql_count, tuple(count_params))
         total_events = cursor.fetchone()['count']
@@ -486,6 +558,8 @@ def get_event_detail(current_user_id, event_id):
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
+        base_url = IMAGE_BASE_URL.rstrip('/')
+
         # [MODIFIED] 在 GET 时动态拼接 icon_url，使用 image_filename
         sql_event = """
         SELECT 
@@ -501,7 +575,7 @@ def get_event_detail(current_user_id, event_id):
         FROM events
         WHERE id = %s;
         """
-        cursor.execute(sql_event, (IMAGE_BASE_URL, event_id))
+        cursor.execute(sql_event, (base_url, event_id))
         event_detail = cursor.fetchone()
 
         print(f"📄 Event detail: {event_detail}")
