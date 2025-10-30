@@ -549,7 +549,7 @@ def add_feedback(current_user_id):
     reason = data.get('reason') # [NEW] 从 App 接收
     notes = data.get('notes')
 
-    if not event_id or not image_id or not reason:
+    if not image_id or not reason:
         return jsonify({"success": False, "message": "缺少必需字段 (event_id, image_id, reason)"}), 400
 
     conn = None
