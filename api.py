@@ -561,7 +561,7 @@ def add_feedback(current_user_id):
         # [MODIFIED] 假设 feedback 表已添加 `reason` 列
         sql = """
         INSERT INTO feedback (image_id, user_id, reason, notes, feedback_time)
-        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;
+        VALUES (%s, %s, %s, %s, %s) RETURNING id;
         """
         cursor.execute(sql, (
             image_id, current_user_id, reason, notes, datetime.now()
