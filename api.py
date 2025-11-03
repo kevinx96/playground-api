@@ -173,6 +173,83 @@ def login_user():
                 cursor.close()
             conn.close()
 
+# [NEW] ユーザー情報更新エンドポイント
+@app.route('/api/account/update', methods=['PUT'])
+@token_required
+def update_account(current_user_id):
+    """
+    アカウント情報（ユーザー名、パスワード）を更新します。
+    現在のユーザー名とメールアドレスによる認証が必要です。
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "message": "データが提供されていません"}), 400
+
+    current_username = data.get('username')
+    current_email = data.get('email')
+    new_username = data.get('new_username')
+    new_password = data.get('new_password')
+
+    if not current_username or not current_email:
+        return jsonify({"success": False, "message": "現在のユーザー名とメールアドレスは必須です"}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        # 1. 認証: ユーザーID、ユーザー名、メールが一致するか確認
+        cursor.execute("SELECT username, email FROM users WHERE id = %s", (current_user_id,))
+        user = cursor.fetchone()
+
+        if not user:
+            return jsonify({"success": False, "message": "ユーザーが見つかりません"}), 404
+
+        if user['username'] != current_username or user['email'] != current_email:
+            return jsonify({"success": False, "message": "現在の情報が一致しません"}), 401
+
+        # 2. 更新: new_username または new_password があれば更新
+        update_fields = []
+        params = []
+
+        if new_username and new_username != user['username']:
+            # (オプション) 新しいユーザー名が既に存在するかチェック
+            cursor.execute("SELECT id FROM users WHERE username = %s AND id != %s", (new_username, current_user_id))
+            if cursor.fetchone():
+                return jsonify({"success": False, "message": "そのユーザー名は既に使用されています"}), 409
+            
+            update_fields.append("username = %s")
+            params.append(new_username)
+
+        if new_password:
+            hashed_password = bcrypt.generate_password_hash(new_password).decode('utf-8')
+            update_fields.append("password_hash = %s")
+            params.append(hashed_password)
+
+        if not update_fields:
+            # 何も更新するものがない場合
+            return jsonify({"success": False, "message": "更新する新しい情報がありません"}), 400
+
+        # 3. データベース更新を実行
+        sql_update = f"UPDATE users SET {', '.join(update_fields)} WHERE id = %s"
+        params.append(current_user_id)
+        
+        cursor.execute(sql_update, tuple(params))
+        conn.commit()
+
+        return jsonify({"success": True, "message": "更新しました"}), 200
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        if conn: conn.rollback()
+        print(f"データベースエラー (Update Account): {error}")
+        return jsonify({"success": False, "message": f"データベースエラー: {str(error)}"}), 500
+    finally:
+        if conn:
+            if cursor: cursor.close()
+            conn.close()
+
+
 # --- 摄像头 Endpoints ---
 
 # [MODIFIED] 摄像头注册路由
@@ -712,3 +789,4 @@ if __name__ == '__main__':
     else:
         print("--- Flask 開発サーバー (Debug) を使用します ---")
         app.run(host='0.0.0.0', port=port, debug=True)
+
