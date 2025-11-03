@@ -18,7 +18,7 @@ DATABASE_URL = os.environ.get('DATABASE_URL')
 IMAGE_BASE_URL = os.environ.get('IMAGE_BASE_URL') 
 if not IMAGE_BASE_URL:
     print("警告: 'IMAGE_BASE_URL' 环境变量未设置。HLS 和图片 URL 可能不正确。")
-    IMAGE_BASE_URL = "https://default-please-set-me.ngrok-free.dev" 
+    IMAGE_BASE_URL = "https://subdistichously-polliniferous-ileen.ngrok-free.dev" 
 
 bcrypt = Bcrypt(app)
 
