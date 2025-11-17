@@ -25,7 +25,7 @@ SERVICE_ACCOUNT_FILE = '/etc/secrets/service-account.json' # [NEW] Render Secret
 
 if not IMAGE_BASE_URL:
     print("警告: 'IMAGE_BASE_URL' 环境变量未设置。HLS 和图片 URL 可能不正确。")
-    IMAGE_BASE_URL = "https://default-please-set-me.ngrok-free.dev" 
+    IMAGE_BASE_URL = "https://subdistichously-polliniferous-ileen.ngrok-free.dev" 
 
 bcrypt = Bcrypt(app)
 
