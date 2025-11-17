@@ -15,7 +15,7 @@ from firebase_admin import credentials, messaging
 
 # --- 配置 ---
 app = Flask(__name__)
-
+# ... (配置保持不变) ...
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'my_dev_secret_key_please_change_me')
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -31,6 +31,7 @@ bcrypt = Bcrypt(app)
 
 # --- [NEW] 初始化 Firebase Admin SDK ---
 try:
+# ... (Firebase 初始化保持不变) ...
     if os.path.exists(SERVICE_ACCOUNT_FILE):
         cred = credentials.Certificate(SERVICE_ACCOUNT_FILE)
         firebase_admin.initialize_app(cred)
@@ -47,6 +48,7 @@ except Exception as e:
 
 # --- 数据库辅助函数 ---
 def get_db_connection():
+# ... (此函数保持不变) ...
     """建立数据库连接"""
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL 环境变量未设置。")
@@ -59,10 +61,7 @@ def get_db_connection():
 
 # --- [MODIFIED] FCM V1 通知功能 ---
 def _send_fcm_notification_v1(event_id, equipment_type, risk_type):
-    """
-    (在单独的线程中运行) 查询所有设备令牌并使用 Firebase Admin SDK (V1) 发送通知。
-    [FIXED] 移除了 send_multicast，改用循环 + send。
-    """
+# ... (函数的主体逻辑保持不变) ...
     
     conn = None
     cursor = None
@@ -78,19 +77,22 @@ def _send_fcm_notification_v1(event_id, equipment_type, risk_type):
             print("没有注册用于通知的设备。", flush=True)
             return
         
-        risk_text = "危险行为" if risk_type == 'abnormal' else "普通事件"
+        # [MODIFIED] 将 risk_type 转换为日语
+        risk_text = "危険行為" if risk_type == 'abnormal' else "通常イベント"
 
         # --- [MODIFIED] 循环发送 ---
         
         # 1. 定义 payload (所有消息通用)
+        # [MODIFIED] 将通知标题和正文改为日语
         notification = messaging.Notification(
-            title="⚠️ 游乐场安全警报",
-            body=f"在 [{equipment_type}] 检测到新的 [{risk_text}]。"
+            title="⚠️ プレイグラウンド安全アラート",
+            body=f"[{equipment_type}] で新しい [{risk_text}] が検出されました。"
         )
         data_payload = {
             "click_action": "FLUTTER_NOTIFICATION_CLICK",
             "event_id": str(event_id)
         }
+# ... (消息的其余部分 (android_config, apns_config) 保持不变) ...
         android_config = messaging.AndroidConfig(
             priority="high",
             notification=messaging.AndroidNotification(sound="default")
@@ -108,11 +110,11 @@ def _send_fcm_notification_v1(event_id, equipment_type, risk_type):
 
         # 2. 遍历所有令牌
         for token in device_tokens:
-            # 3. 为每个令牌创建单独的 Message (不再使用 MulticastMessage)
+            # 3. 为每个令牌创建单独的 Message
             message = messaging.Message(
                 notification=notification,
                 data=data_payload,
-                token=token, # [MODIFIED] 指定单个令牌
+                token=token, 
                 android=android_config,
                 apns=apns_config
             )
@@ -277,7 +279,6 @@ def login_user():
             token = jwt.encode({
                 'user_id': user['id'],
                 'username': user['username'],
-                # [FIXED] 修复 DeprecationWarning
                 'exp': datetime.now(UTC) + timedelta(hours=24) 
             }, app.config['SECRET_KEY'], algorithm="HS256")
             
