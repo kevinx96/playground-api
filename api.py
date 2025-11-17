@@ -2,7 +2,7 @@ import os
 import psycopg2
 import json
 from flask import Flask, jsonify, request
-from datetime import datetime, timedelta, UTC # [MODIFIED] 导入 UTC
+from datetime import datetime, timedelta, UTC 
 from flask_bcrypt import Bcrypt
 from psycopg2.extras import RealDictCursor, execute_batch
 import decimal
@@ -25,7 +25,7 @@ SERVICE_ACCOUNT_FILE = '/etc/secrets/service-account.json'
 
 if not IMAGE_BASE_URL:
     print("警告: 'IMAGE_BASE_URL' 环境变量未设置。HLS 和图片 URL 可能不正确。", flush=True)
-    IMAGE_BASE_URL = "https://subdistichously-polliniferous-ileen.ngrok-free.dev" 
+    IMAGE_BASE_URL = "https://default-please-set-me.ngrok-free.dev" 
 
 bcrypt = Bcrypt(app)
 
@@ -61,6 +61,7 @@ def get_db_connection():
 def _send_fcm_notification_v1(event_id, equipment_type, risk_type):
     """
     (在单独的线程中运行) 查询所有设备令牌并使用 Firebase Admin SDK (V1) 发送通知。
+    [FIXED] 移除了 send_multicast，改用循环 + send。
     """
     
     conn = None
@@ -79,44 +80,60 @@ def _send_fcm_notification_v1(event_id, equipment_type, risk_type):
         
         risk_text = "危险行为" if risk_type == 'abnormal' else "普通事件"
 
+        # --- [MODIFIED] 循环发送 ---
+        
+        # 1. 定义 payload (所有消息通用)
         notification = messaging.Notification(
             title="⚠️ 游乐场安全警报",
             body=f"在 [{equipment_type}] 检测到新的 [{risk_text}]。"
         )
-        
         data_payload = {
             "click_action": "FLUTTER_NOTIFICATION_CLICK",
             "event_id": str(event_id)
         }
-
-        message = messaging.MulticastMessage(
-            tokens=device_tokens,
-            notification=notification,
-            data=data_payload,
-            android=messaging.AndroidConfig(
-                priority="high",
-                notification=messaging.AndroidNotification(
-                    sound="default"
-                )
+        android_config = messaging.AndroidConfig(
+            priority="high",
+            notification=messaging.AndroidNotification(sound="default")
+        )
+        apns_config = messaging.APNSConfig(
+            payload=messaging.APNSPayload(
+                aps=messaging.Aps(sound="default", content_available=True)
             ),
-            apns=messaging.APNSConfig(
-                payload=messaging.APNSPayload(
-                    aps=messaging.Aps(
-                        sound="default",
-                        content_available=True
-                    )
-                ),
-                headers={"apns-priority": "10"}
-            )
+            headers={"apns-priority": "10"}
         )
 
-        response = messaging.send_multicast(message)
-        
-        print(f"FCM V1 响应: 成功 {response.success_count} 条, 失败 {response.failure_count} 条。", flush=True)
-        if response.failure_count > 0:
-            for i, resp in enumerate(response.responses):
-                if not resp.success:
-                    print(f"   - 失败令牌: {device_tokens[i]}, 错误: {resp.exception}", flush=True)
+        success_count = 0
+        failure_count = 0
+        failed_token_details = []
+
+        # 2. 遍历所有令牌
+        for token in device_tokens:
+            # 3. 为每个令牌创建单独的 Message (不再使用 MulticastMessage)
+            message = messaging.Message(
+                notification=notification,
+                data=data_payload,
+                token=token, # [MODIFIED] 指定单个令牌
+                android=android_config,
+                apns=apns_config
+            )
+
+            try:
+                # 4. 使用 messaging.send() 单独发送
+                response = messaging.send(message)
+                print(f"FCM: 成功发送到: {token} (MsgID: {response})", flush=True)
+                success_count += 1
+            except Exception as e:
+                # 捕获发送到单个令牌的失败
+                print(f"FCM: 发送到 {token} 失败: {e}", flush=True)
+                failure_count += 1
+                failed_token_details.append(f"令牌: {token}, 错误: {e}")
+
+        # 5. 打印最终的批量发送报告
+        print(f"FCM V1 响应: 成功 {success_count} 条, 失败 {failure_count} 条。", flush=True)
+        if failure_count > 0:
+            for detail in failed_token_details:
+                print(f"   - {detail}", flush=True)
+        # --- 结束循环发送 ---
 
     
     except (Exception, psycopg2.DatabaseError) as error:
@@ -126,6 +143,7 @@ def _send_fcm_notification_v1(event_id, equipment_type, risk_type):
         if conn: conn.close()
 
 def start_fcm_notification_thread(event_id, equipment_type, risk_type):
+# ... (此函数保持不变) ...
     """
     启动一个新线程来发送 FCM V1 通知。
     """
@@ -139,6 +157,7 @@ def start_fcm_notification_thread(event_id, equipment_type, risk_type):
 
 
 class CustomJSONEncoder(json.JSONEncoder):
+# ... (此函数保持不变) ...
     def default(self, obj):
         if isinstance(obj, datetime):
             return obj.isoformat() + 'Z'
@@ -150,6 +169,7 @@ app.json_encoder = CustomJSONEncoder
 
 # --- 认证装饰器 ---
 def token_required(f):
+# ... (此函数保持不变) ...
     @wraps(f)
     def decorated(*args, **kwargs):
         token = None
@@ -180,6 +200,7 @@ def token_required(f):
 
 @app.route('/', methods=['GET'])
 def home():
+# ... (此函数保持不变) ...
     """根路径，返回欢迎信息"""
     return jsonify({
         "message": "安全摄像头项目 API 服务器",
@@ -191,6 +212,7 @@ def home():
 
 @app.route('/api/auth/register', methods=['POST'])
 def register_user():
+# ... (此函数保持不变) ...
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
@@ -234,6 +256,7 @@ def register_user():
 
 @app.route('/api/auth/login', methods=['POST'])
 def login_user():
+# ... (此函数保持不变) ...
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
@@ -282,6 +305,7 @@ def login_user():
 @app.route('/api/account/update', methods=['PUT'])
 @token_required
 def update_account(current_user_id):
+# ... (此函数保持不变) ...
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "数据未提供"}), 400
@@ -350,6 +374,7 @@ def update_account(current_user_id):
 @app.route('/api/account/register-device', methods=['POST'])
 @token_required
 def register_device(current_user_id):
+# ... (此函数保持不变) ...
     data = request.get_json()
     device_token = data.get('device_token')
     if not device_token:
@@ -388,6 +413,7 @@ def register_device(current_user_id):
 
 @app.route('/api/cameras/register', methods=['POST'])
 def register_camera():
+# ... (此函数保持不变) ...
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "No data provided"}), 400
@@ -440,6 +466,7 @@ def register_camera():
 @app.route('/api/cameras', methods=['GET'])
 @token_required
 def get_cameras(current_user_id):
+# ... (此函数保持不变) ...
     conn = None
     try:
         conn = get_db_connection()
@@ -462,6 +489,7 @@ def get_cameras(current_user_id):
 @app.route('/api/cameras/<int:camera_id>/stream', methods=['GET'])
 @token_required
 def get_camera_stream(current_user_id, camera_id):
+# ... (此函数保持不变) ...
     conn = None
     try:
         conn = get_db_connection()
@@ -491,6 +519,7 @@ def get_camera_stream(current_user_id, camera_id):
 
 @app.route('/api/event/submit', methods=['POST'])
 def add_event():
+# ... (此函数保持不变) ...
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "未提供输入数据"}), 400
@@ -638,6 +667,7 @@ def add_event():
 @app.route('/api/events', methods=['GET'])
 @token_required
 def get_events(current_user_id):
+# ... (此函数保持不变) ...
     try:
         page = int(request.args.get('page', 1))
         limit = int(request.args.get('limit', 20))
@@ -723,6 +753,7 @@ def get_events(current_user_id):
 @app.route('/api/events/<int:event_id>', methods=['GET'])
 @token_required
 def get_event_detail(current_user_id, event_id):
+# ... (此函数保持不变) ...
     conn = None
     cursor = None
     try:
@@ -799,6 +830,7 @@ def get_event_detail(current_user_id, event_id):
 @app.route('/api/feedback', methods=['POST'])
 @token_required
 def add_feedback(current_user_id):
+# ... (此函数保持不变) ...
     data = request.get_json()
     image_id = data.get('image_id')
     reason = data.get('reason')
@@ -840,6 +872,7 @@ def add_feedback(current_user_id):
 @app.route('/api/reports', methods=['GET'])
 @token_required
 def get_periodic_report(current_user_id):
+# ... (此函数保持不变) ...
     report_type = request.args.get('type', 'monthly')
     
     conn = None
@@ -882,6 +915,7 @@ def get_periodic_report(current_user_id):
 
 # --- 启动服务器 ---
 if __name__ == '__main__':
+# ... (此函数保持不变) ...
     port = int(os.environ.get('PORT', 5000))
     print(f"--- Flask API サーバーをポート {port} で起動します ---", flush=True)
     print(f"Listening on 0.0.0.0:{port}", flush=True)
