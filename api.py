@@ -8,6 +8,10 @@ from psycopg2.extras import RealDictCursor, execute_batch
 import decimal
 import jwt
 from functools import wraps
+import requests
+import threading
+import firebase_admin # [NEW] 导入 Firebase Admin
+from firebase_admin import credentials, messaging # [NEW] 导入 credentials 和 messaging
 
 # --- 配置 ---
 app = Flask(__name__)
@@ -16,11 +20,32 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'my_dev_secret_key_pleas
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
 IMAGE_BASE_URL = os.environ.get('IMAGE_BASE_URL') 
+FCM_PROJECT_ID = os.environ.get('FCM_PROJECT_ID') # [NEW] V1 需要
+SERVICE_ACCOUNT_FILE = '/etc/secrets/service-account.json' # [NEW] Render Secret File 路径
+
 if not IMAGE_BASE_URL:
     print("警告: 'IMAGE_BASE_URL' 环境变量未设置。HLS 和图片 URL 可能不正确。")
-    IMAGE_BASE_URL = "https://subdistichously-polliniferous-ileen.ngrok-free.dev" 
+    IMAGE_BASE_URL = "https://default-please-set-me.ngrok-free.dev" 
 
 bcrypt = Bcrypt(app)
+
+# --- [NEW] 初始化 Firebase Admin SDK ---
+try:
+    if os.path.exists(SERVICE_ACCOUNT_FILE):
+        cred = credentials.Certificate(SERVICE_ACCOUNT_FILE)
+        firebase_admin.initialize_app(cred)
+        print("Firebase Admin SDK 初始化成功。")
+    else:
+        # 这是一个关键错误，因为 Render Secret File [cite:`Firebase_FCM_V1_Guide.md`] 应该存在
+        print("严重错误: 未找到 'service-account.json'。FCM 通知将无法发送。")
+except Exception as e:
+    # 避免因重复初始化而崩溃 (例如在本地调试时)
+    if 'already exists' in str(e):
+        print("Firebase Admin SDK 已初始化。")
+    else:
+        print(f"Firebase Admin SDK 初始化失败: {e}")
+# --- 结束 Firebase 初始化 ---
+
 
 # --- 数据库辅助函数 ---
 def get_db_connection():
@@ -33,6 +58,99 @@ def get_db_connection():
     except psycopg2.OperationalError as e:
         print(f"数据库连接失败: {e}")
         raise
+
+# --- [MODIFIED] FCM V1 通知功能 ---
+def _send_fcm_notification_v1(event_id, equipment_type, risk_type):
+    """
+    (在单独的线程中运行) 查询所有设备令牌并使用 Firebase Admin SDK (V1) 发送通知。
+    """
+    if not firebase_admin._DEFAULT_APP:
+        print("Firebase Admin SDK 未初始化，跳过通知。")
+        return
+
+    conn = None
+    cursor = None
+    try:
+        # 在新线程中，必须创建新的数据库连接
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cursor.execute("SELECT device_token FROM user_devices")
+        rows = cursor.fetchall()
+        device_tokens = [row['device_token'] for row in rows]
+
+        if not device_tokens:
+            print("没有注册用于通知的设备。")
+            return
+        
+        # 将内部 risk_type 转换为用户友好的中文
+        risk_text = "危险行为" if risk_type == 'abnormal' else "普通事件"
+
+        # 1. 创建通知体 (Notification)
+        notification = messaging.Notification(
+            title="⚠️ 游乐场安全警报",
+            body=f"在 [{equipment_type}] 检测到新的 [{risk_text}]。"
+        )
+        
+        # 2. 创建数据负载 (Data Payload)
+        data_payload = {
+            "click_action": "FLUTTER_NOTIFICATION_CLICK",
+            "event_id": str(event_id)
+        }
+
+        # 3. 创建多播消息 (MulticastMessage)
+        message = messaging.MulticastMessage(
+            tokens=device_tokens,
+            notification=notification,
+            data=data_payload,
+            # [NEW] 设置 Android 特定的高优先级
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    sound="default"
+                )
+            ),
+            # [NEW] 设置 Apple 特定的优先级
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        sound="default",
+                        content_available=True
+                    )
+                ),
+                headers={"apns-priority": "10"}
+            )
+        )
+
+        # 4. 发送消息
+        response = messaging.send_multicast(message)
+        
+        print(f"FCM V1 响应: 成功 {response.success_count} 条, 失败 {response.failure_count} 条。")
+        if response.failure_count > 0:
+            for i, resp in enumerate(response.responses):
+                if not resp.success:
+                    print(f"  - 失败令牌: {device_tokens[i]}, 错误: {resp.exception}")
+
+    
+    except (Exception, psycopg2.DatabaseError) as error:
+        print(f"FCM 线程中出错: {error}")
+    finally:
+        # 确保在新线程中关闭连接
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+def start_fcm_notification_thread(event_id, equipment_type, risk_type):
+    """
+    启动一个新线程来发送 FCM V1 通知。
+    """
+    thread = threading.Thread(
+        target=_send_fcm_notification_v1, # [MODIFIED] 调用 V1 函数
+        args=(event_id, equipment_type, risk_type)
+    )
+    thread.daemon = True
+    thread.start()
+# --- 结束 FCM 功能 ---
+
 
 class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -173,17 +291,16 @@ def login_user():
                 cursor.close()
             conn.close()
 
-# [NEW] ユーザー情報更新エンドポイント
+# ユーザー情報更新エンドポイント
 @app.route('/api/account/update', methods=['PUT'])
 @token_required
 def update_account(current_user_id):
     """
-    アカウント情報（ユーザー名、パスワード）を更新します。
-    現在のユーザー名とメールアドレスによる認証が必要です。
+    (无变化) 账号更新
     """
     data = request.get_json()
     if not data:
-        return jsonify({"success": False, "message": "データが提供されていません"}), 400
+        return jsonify({"success": False, "message": "数据未提供"}), 400
 
     current_username = data.get('username')
     current_email = data.get('email')
@@ -191,7 +308,7 @@ def update_account(current_user_id):
     new_password = data.get('new_password')
 
     if not current_username or not current_email:
-        return jsonify({"success": False, "message": "現在のユーザー名とメールアドレスは必須です"}), 400
+        return jsonify({"success": False, "message": "当前用户名和邮箱是必需的"}), 400
 
     conn = None
     cursor = None
@@ -199,25 +316,22 @@ def update_account(current_user_id):
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-        # 1. 認証: ユーザーID、ユーザー名、メールが一致するか確認
         cursor.execute("SELECT username, email FROM users WHERE id = %s", (current_user_id,))
         user = cursor.fetchone()
 
         if not user:
-            return jsonify({"success": False, "message": "ユーザーが見つかりません"}), 404
+            return jsonify({"success": False, "message": "用户未找到"}), 404
 
         if user['username'] != current_username or user['email'] != current_email:
-            return jsonify({"success": False, "message": "現在の情報が一致しません"}), 401
+            return jsonify({"success": False, "message": "当前信息不匹配"}), 401
 
-        # 2. 更新: new_username または new_password があれば更新
         update_fields = []
         params = []
 
         if new_username and new_username != user['username']:
-            # (オプション) 新しいユーザー名が既に存在するかチェック
             cursor.execute("SELECT id FROM users WHERE username = %s AND id != %s", (new_username, current_user_id))
             if cursor.fetchone():
-                return jsonify({"success": False, "message": "そのユーザー名は既に使用されています"}), 409
+                return jsonify({"success": False, "message": "该用户名已被使用"}), 409
             
             update_fields.append("username = %s")
             params.append(new_username)
@@ -228,22 +342,63 @@ def update_account(current_user_id):
             params.append(hashed_password)
 
         if not update_fields:
-            # 何も更新するものがない場合
-            return jsonify({"success": False, "message": "更新する新しい情報がありません"}), 400
+            return jsonify({"success": False, "message": "没有要更新的新信息"}), 400
 
-        # 3. データベース更新を実行
         sql_update = f"UPDATE users SET {', '.join(update_fields)} WHERE id = %s"
         params.append(current_user_id)
         
         cursor.execute(sql_update, tuple(params))
         conn.commit()
 
-        return jsonify({"success": True, "message": "更新しました"}), 200
+        return jsonify({"success": True, "message": "更新成功"}), 200
 
     except (Exception, psycopg2.DatabaseError) as error:
         if conn: conn.rollback()
-        print(f"データベースエラー (Update Account): {error}")
-        return jsonify({"success": False, "message": f"データベースエラー: {str(error)}"}), 500
+        print(f"数据库错误 (Update Account): {error}")
+        return jsonify({"success": False, "message": f"数据库错误: {str(error)}"}), 500
+    finally:
+        if conn:
+            if cursor: cursor.close()
+            conn.close()
+
+
+# [NEW] 注册 FCM 设备令牌的端点
+@app.route('/api/account/register-device', methods=['POST'])
+@token_required
+def register_device(current_user_id):
+    """
+    接收并存储 Flutter App 发送的 FCM 设备令牌。
+    """
+    data = request.get_json()
+    device_token = data.get('device_token')
+    if not device_token:
+        return jsonify({"success": False, "message": "device_token is required"}), 400
+    
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # 使用 UPSERT 逻辑:
+        # 如果 device_token 冲突 (已存在), 则更新 user_id
+        sql_upsert = """
+        INSERT INTO user_devices (user_id, device_token, created_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (device_token) DO UPDATE SET
+            user_id = EXCLUDED.user_id,
+            created_at = NOW();
+        """
+        cursor.execute(sql_upsert, (current_user_id, device_token))
+        conn.commit()
+        
+        print(f"设备令牌已注册/更新，用户 ID: {current_user_id}")
+        return jsonify({"success": True, "message": "Device registered successfully"}), 201
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        if conn: conn.rollback()
+        print(f"数据库错误 (Register Device): {error}")
+        return jsonify({"success": False, "message": f"数据库错误: {str(error)}"}), 500
     finally:
         if conn:
             if cursor: cursor.close()
@@ -252,20 +407,16 @@ def update_account(current_user_id):
 
 # --- 摄像头 Endpoints ---
 
-# [MODIFIED] 摄像头注册路由
 @app.route('/api/cameras/register', methods=['POST'])
 def register_camera():
     """
-    [MODIFIED] 接收来自本地脚本的摄像头数据。
-    使用 UPSERT (UPDATE or INSERT) 逻辑，不再使用 TRUNCATE。
-    这会保留所有现有的事件数据。
+    (无变化) 摄像头 UPSERT 逻辑
     """
-    # 这是一个内部端点，不需要 token
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "No data provided"}), 400
 
-    # 你的脚本发送 'camera_id_logical' = 1
+    # 你的脚本 [cite:`live_analysis_v2.py`] 应该发送 'camera_id_logical'
     logical_id = data.get('camera_id_logical', 1) 
     cam_name = data.get('name', 'Default Camera')
     hls_filename = data.get('hls_filename')
@@ -273,11 +424,10 @@ def register_camera():
     if not hls_filename:
         return jsonify({"success": False, "message": "hls_filename is required"}), 400
     
-    if not IMAGE_BASE_URL:
-         print("CRITICAL ERROR: IMAGE_BASE_URL is not set in environment.")
-         return jsonify({"success": False, "message": "Server configuration error: IMAGE_BASE_URL not set"}), 500
+    if not IMAGE_BASE_URL or "default-please-set-me" in IMAGE_BASE_URL:
+         print("严重错误: IMAGE_BASE_URL 环境变量未在 Render 上正确设置。")
+         return jsonify({"success": False, "message": "服务器配置错误: IMAGE_BASE_URL not set"}), 500
 
-    # 拼接完整的 HLS URL
     stream_url = IMAGE_BASE_URL.rstrip('/') + '/' + hls_filename.lstrip('/')
     
     conn = None
@@ -286,8 +436,6 @@ def register_camera():
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # [NEW] 使用 UPSERT (INSERT ... ON CONFLICT DO UPDATE)
-        # 这会尝试插入 id=1 的摄像头。如果 id=1 已存在，它会执行 UPDATE。
         sql_upsert = """
         INSERT INTO cameras (id, name, stream_url, status, is_active)
         VALUES (%s, %s, %s, 'online', true)
@@ -314,16 +462,15 @@ def register_camera():
             if cursor: cursor.close()
             conn.close()
 
-
 @app.route('/api/cameras', methods=['GET'])
 @token_required
 def get_cameras(current_user_id):
+    """ (无变化) """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        # [MODIFIED] 不再查询 stream_url，App 应该使用 /api/cameras/<id>/stream
         cursor.execute("SELECT id, name, status FROM cameras WHERE is_active = true ORDER BY name ASC")
         cameras = cursor.fetchall()
         
@@ -341,12 +488,12 @@ def get_cameras(current_user_id):
 @app.route('/api/cameras/<int:camera_id>/stream', methods=['GET'])
 @token_required
 def get_camera_stream(current_user_id, camera_id):
+    """ (无变化) """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        # 你的 APP 设计书 [cite:`総計画書1.1 (1).docx`] 指出此端点用于获取 stream_url
         cursor.execute("SELECT stream_url FROM cameras WHERE id = %s AND is_active = true", (camera_id,))
         camera = cursor.fetchone()
         
@@ -372,7 +519,7 @@ def get_camera_stream(current_user_id, camera_id):
 @app.route('/api/event/submit', methods=['POST'])
 def add_event():
     """
-    [MODIFIED] 接收AI脚本的事件数据。
+    [MODIFIED] 触发 FCM 通知的逻辑已更新为 V1。
     """
     data = request.get_json()
     if not data:
@@ -419,7 +566,6 @@ def add_event():
     request_deductions_set = set(deductions_list)
     thumbnail_filename = image_filename
     
-    # [NEW] 使用 image_filename 生成完整的 icon URL
     icon_url = None
     if thumbnail_filename:
         icon_url = IMAGE_BASE_URL.rstrip('/') + '/' + thumbnail_filename.lstrip('/')
@@ -487,6 +633,11 @@ def add_event():
             ))
             event_id_to_use = cursor.fetchone()['id']
 
+            # [MODIFIED] 触发 V1 通知
+            if risk_type == 'abnormal':
+                print(f"新的 'abnormal' 事件 (ID: {event_id_to_use}) 已创建。触发 FCM V1 通知。")
+                start_fcm_notification_thread(event_id_to_use, equipment_type, risk_type)
+
         # --- 4. 插入图片详情（对合并或新建都执行） ---
         image_url_prefix = IMAGE_BASE_URL.rstrip('/')
         image_records = []
@@ -513,19 +664,18 @@ def add_event():
     except (Exception, psycopg2.DatabaseError) as error:
         if conn: conn.rollback()
         print(f"数据库错误 (Add Event): {error}")
-        # [FIX] 撤销了自定义的 camera_id 错误，直接返回原始数据库错误
         return jsonify({"success": False, "message": f"数据库错误: {str(error)}"}), 500
     finally:
         if conn:
             if cursor: cursor.close()
             conn.close()
 
+# --- 其他 Endpoints (无变化) ---
+
 @app.route('/api/events', methods=['GET'])
 @token_required
 def get_events(current_user_id):
-    """
-    [MODIFIED] 返回事件列表，现在拼接 icon_url 和 image_url
-    """
+    """ (无变化) """
     try:
         page = int(request.args.get('page', 1))
         limit = int(request.args.get('limit', 20))
@@ -541,7 +691,6 @@ def get_events(current_user_id):
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-        # 在 GET 时动态拼接 icon_url 和 image_url
         base_url = IMAGE_BASE_URL.rstrip('/')
         
         sql_data = """
@@ -586,7 +735,6 @@ def get_events(current_user_id):
         cursor.execute(sql_data, tuple(params))
         events = cursor.fetchall()
 
-        # count 查询需要移除 base_url 参数
         count_params = [p for p in params[2:] if p not in [limit, offset]]
         cursor.execute(sql_count, tuple(count_params))
         total_events = cursor.fetchone()['count']
@@ -613,6 +761,7 @@ def get_events(current_user_id):
 @app.route('/api/events/<int:event_id>', methods=['GET'])
 @token_required
 def get_event_detail(current_user_id, event_id):
+    """ (无变化) """
     conn = None
     cursor = None
     try:
@@ -686,11 +835,10 @@ def get_event_detail(current_user_id, event_id):
             if cursor: cursor.close()
             conn.close()
 
-# --- 反馈 (Feedback) Endpoints ---
-
 @app.route('/api/feedback', methods=['POST'])
 @token_required
 def add_feedback(current_user_id):
+    """ (无变化) """
     data = request.get_json()
     image_id = data.get('image_id')
     reason = data.get('reason')
@@ -729,11 +877,10 @@ def add_feedback(current_user_id):
             if cursor: cursor.close()
             conn.close()
 
-# --- 定期报告 (Reports) Endpoints ---
-
 @app.route('/api/reports', methods=['GET'])
 @token_required
 def get_periodic_report(current_user_id):
+    """ (无变化) """
     report_type = request.args.get('type', 'monthly')
     
     conn = None
@@ -787,6 +934,5 @@ if __name__ == '__main__':
         from waitress import serve
         serve(app, host='0.0.0.0', port=port)
     else:
-        print("--- Flask 開発サーバー (Debug) を使用します ---")
+        print("--- Flask 开发サーバー (Debug) を使用します ---")
         app.run(host='0.0.0.0', port=port, debug=True)
-
