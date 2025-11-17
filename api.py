@@ -25,7 +25,7 @@ SERVICE_ACCOUNT_FILE = '/etc/secrets/service-account.json' # [NEW] Render Secret
 
 if not IMAGE_BASE_URL:
     print("警告: 'IMAGE_BASE_URL' 环境变量未设置。HLS 和图片 URL 可能不正确。")
-    IMAGE_BASE_URL = "https://subdistichously-polliniferous-ileen.ngrok-free.dev" 
+    IMAGE_BASE_URL = "https://default-please-set-me.ngrok-free.dev" 
 
 bcrypt = Bcrypt(app)
 
@@ -49,6 +49,7 @@ except Exception as e:
 
 # --- 数据库辅助函数 ---
 def get_db_connection():
+# ... (此函数保持不变) ...
     """建立数据库连接"""
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL 环境变量未设置。")
@@ -64,10 +65,9 @@ def _send_fcm_notification_v1(event_id, equipment_type, risk_type):
     """
     (在单独的线程中运行) 查询所有设备令牌并使用 Firebase Admin SDK (V1) 发送通知。
     """
-    if not firebase_admin._DEFAULT_APP:
-        print("Firebase Admin SDK 未初始化，跳过通知。")
-        return
-
+    # [FIXED] 移除了错误的 "if not firebase_admin._DEFAULT_APP:" 检查。
+    # 我们将依赖下面的 try/except 块来捕获包括初始化失败在内的所有错误。
+    
     conn = None
     cursor = None
     try:
@@ -129,10 +129,11 @@ def _send_fcm_notification_v1(event_id, equipment_type, risk_type):
         if response.failure_count > 0:
             for i, resp in enumerate(response.responses):
                 if not resp.success:
-                    print(f"  - 失败令牌: {device_tokens[i]}, 错误: {resp.exception}")
+                    print(f"   - 失败令牌: {device_tokens[i]}, 错误: {resp.exception}")
 
     
     except (Exception, psycopg2.DatabaseError) as error:
+        # [NEW] 现在这个 except 块也会捕获 Firebase 的初始化错误
         print(f"FCM 线程中出错: {error}")
     finally:
         # 确保在新线程中关闭连接
@@ -140,6 +141,7 @@ def _send_fcm_notification_v1(event_id, equipment_type, risk_type):
         if conn: conn.close()
 
 def start_fcm_notification_thread(event_id, equipment_type, risk_type):
+# ... (此函数保持不变) ...
     """
     启动一个新线程来发送 FCM V1 通知。
     """
@@ -153,6 +155,7 @@ def start_fcm_notification_thread(event_id, equipment_type, risk_type):
 
 
 class CustomJSONEncoder(json.JSONEncoder):
+# ... (此函数保持不变) ...
     def default(self, obj):
         if isinstance(obj, datetime):
             return obj.isoformat() + 'Z'
@@ -164,6 +167,7 @@ app.json_encoder = CustomJSONEncoder
 
 # --- 认证装饰器 ---
 def token_required(f):
+# ... (此函数保持不变) ...
     @wraps(f)
     def decorated(*args, **kwargs):
         token = None
@@ -194,6 +198,7 @@ def token_required(f):
 
 @app.route('/', methods=['GET'])
 def home():
+# ... (此函数保持不变) ...
     """根路径，返回欢迎信息"""
     return jsonify({
         "message": "安全摄像头项目 API 服务器",
@@ -205,6 +210,7 @@ def home():
 
 @app.route('/api/auth/register', methods=['POST'])
 def register_user():
+# ... (此函数保持不变) ...
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
@@ -248,6 +254,7 @@ def register_user():
 
 @app.route('/api/auth/login', methods=['POST'])
 def login_user():
+# ... (此函数保持不变) ...
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
@@ -295,6 +302,7 @@ def login_user():
 @app.route('/api/account/update', methods=['PUT'])
 @token_required
 def update_account(current_user_id):
+# ... (此函数保持不变) ...
     """
     (无变化) 账号更新
     """
@@ -366,6 +374,7 @@ def update_account(current_user_id):
 @app.route('/api/account/register-device', methods=['POST'])
 @token_required
 def register_device(current_user_id):
+# ... (此函数保持不变) ...
     """
     接收并存储 Flutter App 发送的 FCM 设备令牌。
     """
@@ -409,6 +418,7 @@ def register_device(current_user_id):
 
 @app.route('/api/cameras/register', methods=['POST'])
 def register_camera():
+# ... (此函数保持不变) ...
     """
     (无变化) 摄像头 UPSERT 逻辑
     """
@@ -465,6 +475,7 @@ def register_camera():
 @app.route('/api/cameras', methods=['GET'])
 @token_required
 def get_cameras(current_user_id):
+# ... (此函数保持不变) ...
     """ (无变化) """
     conn = None
     try:
@@ -488,6 +499,7 @@ def get_cameras(current_user_id):
 @app.route('/api/cameras/<int:camera_id>/stream', methods=['GET'])
 @token_required
 def get_camera_stream(current_user_id, camera_id):
+# ... (此函数保持不变) ...
     """ (无变化) """
     conn = None
     try:
@@ -518,6 +530,7 @@ def get_camera_stream(current_user_id, camera_id):
 
 @app.route('/api/event/submit', methods=['POST'])
 def add_event():
+# ... (此函数保持不变) ...
     """
     [MODIFIED] 触发 FCM 通知的逻辑已更新为 V1。
     """
@@ -675,6 +688,7 @@ def add_event():
 @app.route('/api/events', methods=['GET'])
 @token_required
 def get_events(current_user_id):
+# ... (此函数保持不变) ...
     """ (无变化) """
     try:
         page = int(request.args.get('page', 1))
@@ -761,6 +775,7 @@ def get_events(current_user_id):
 @app.route('/api/events/<int:event_id>', methods=['GET'])
 @token_required
 def get_event_detail(current_user_id, event_id):
+# ... (此函数保持不变) ...
     """ (无变化) """
     conn = None
     cursor = None
@@ -838,6 +853,7 @@ def get_event_detail(current_user_id, event_id):
 @app.route('/api/feedback', methods=['POST'])
 @token_required
 def add_feedback(current_user_id):
+# ... (此函数保持不变) ...
     """ (无变化) """
     data = request.get_json()
     image_id = data.get('image_id')
@@ -880,6 +896,7 @@ def add_feedback(current_user_id):
 @app.route('/api/reports', methods=['GET'])
 @token_required
 def get_periodic_report(current_user_id):
+# ... (此函数保持不变) ...
     """ (无变化) """
     report_type = request.args.get('type', 'monthly')
     
@@ -923,6 +940,7 @@ def get_periodic_report(current_user_id):
 
 # --- 启动服务器 ---
 if __name__ == '__main__':
+# ... (此函数保持不变) ...
     port = int(os.environ.get('PORT', 5000))
     print(f"--- Flask API サーバーをポート {port} で起動します ---")
     print(f"Listening on 0.0.0.0:{port}")
@@ -934,5 +952,5 @@ if __name__ == '__main__':
         from waitress import serve
         serve(app, host='0.0.0.0', port=port)
     else:
-        print("--- Flask 开发サーバー (Debug) を使用します ---")
+        print("--- Flask 開発サーバー (Debug) を使用します ---")
         app.run(host='0.0.0.0', port=port, debug=True)
