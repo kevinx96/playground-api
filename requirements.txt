@@ -3,3 +3,6 @@ psycopg2-binary
 Flask-Bcrypt
 PyJWT
 waitress
+requests
+firebase-admin
+google-auth
