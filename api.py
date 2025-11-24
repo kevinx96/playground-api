@@ -873,39 +873,116 @@ def add_feedback(current_user_id):
 @app.route('/api/reports', methods=['GET'])
 @token_required
 def get_periodic_report(current_user_id):
-# ... (此函数保持不变) ...
-    report_type = request.args.get('type', 'monthly')
-    
-    conn = None
+    """
+    [MODIFIED] 动态生成本月报告，不依赖 reports 表。
+    包含硬编码的模型状态和动态的事件统计。
+    """
     try:
+        # 1. 确定当前月份的时间范围
+        now = datetime.now()
+        start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # 下个月的第一天
+        if now.month == 12:
+            start_of_next_month = now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0)
+        else:
+            start_of_next_month = now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0)
+        
+        current_month_str = now.strftime("%Y年%m月")
+
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        # 2. 统计本月所有事件数量
+        cursor.execute("""
+            SELECT COUNT(*) as total 
+            FROM events 
+            WHERE event_time >= %s AND event_time < %s
+        """, (start_of_month, start_of_next_month))
+        total_events = cursor.fetchone()['total']
+
+        # 3. 统计游具种类比例 (Pie Chart 1)
+        cursor.execute("""
+            SELECT equipment_type, COUNT(*) as count
+            FROM events
+            WHERE event_time >= %s AND event_time < %s
+            GROUP BY equipment_type
+        """, (start_of_month, start_of_next_month))
+        equipment_stats = cursor.fetchall()
+
+        # 4. 统计时间段分布 (Pie Chart 2)
+        # 在 SQL 中处理时间段可能比较复杂，这里获取小时数并在 Python 中处理
+        cursor.execute("""
+            SELECT EXTRACT(HOUR FROM event_time) as hour
+            FROM events
+            WHERE event_time >= %s AND event_time < %s
+        """, (start_of_month, start_of_next_month))
+        time_rows = cursor.fetchall()
+
+        time_distribution = {
+            "0-12": 0,
+            "12-14": 0,
+            "14-16": 0,
+            "16-18": 0,
+            "18-24": 0
+        }
+
+        for row in time_rows:
+            h = int(row['hour'])
+            if h < 12:
+                time_distribution["0-12"] += 1
+            elif 12 <= h < 14:
+                time_distribution["12-14"] += 1
+            elif 14 <= h < 16:
+                time_distribution["14-16"] += 1
+            elif 16 <= h < 18:
+                time_distribution["16-18"] += 1
+            else:
+                time_distribution["18-24"] += 1
+
+        # 5. 构建硬编码的模型数据
+        model_stats = [
+            {
+                "name": "model-prototype",
+                "status": "inactive",
+                "f2_score": "74.22%",
+                "activation_count": "124"
+            },
+            {
+                "name": "model-hrnet1",
+                "status": "inactive",
+                "f2_score": "80.12%",
+                "activation_count": "305"
+            },
+            {
+                "name": "model-mmpose1",
+                "status": "active",
+                "f2_score": "93.85%",
+                "activation_count": "2668"
+            }
+        ]
+
+        # 6. 组合最终 JSON
+        response_data = {
+            "success": True,
+            "report_month": current_month_str,
+            "total_events": total_events,
+            "model_stats": model_stats,
+            "equipment_distribution": [
+                {"label": row['equipment_type'], "value": row['count']} for row in equipment_stats
+            ],
+            "time_distribution": [
+                {"label": k, "value": v} for k, v in time_distribution.items() if v > 0 # 只返回有数据的
+            ]
+        }
         
-        sql = """
-        SELECT summary_data 
-        FROM reports
-        WHERE report_type = %s
-        ORDER BY "year" DESC, "month" DESC, created_at DESC
-        LIMIT 1;
-        """
-        cursor.execute(sql, (report_type,))
-        report = cursor.fetchone()
+        # 如果没有数据，为了让前端不报错，填补一些空数据
+        if not response_data["time_distribution"]:
+             response_data["time_distribution"] = [{"label": "No Data", "value": 1}] # 避免空图
         
-        if report and report['summary_data']:
-            report_data = report['summary_data']
-            
-            if not isinstance(report_data, dict):
-                 report_data = json.loads(report_data)
-                 
-            report_data["success"] = True
-            report_data["report_type"] = report_type
-            
-            return jsonify(report_data)
-        else:
-            return jsonify({"success": False, "message": "未找到可用的定期报告"}), 404
+        return jsonify(response_data)
 
     except (Exception, psycopg2.DatabaseError) as error:
-        print(f"数据库错误 (Get Report): {error}", flush=True)
+        print(f"数据库错误 (Get Periodic Report): {error}", flush=True)
         return jsonify({"success": False, "message": f"数据库错误: {str(error)}"}), 500
     finally:
         if conn:
